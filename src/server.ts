@@ -58,6 +58,20 @@ function toolSummary(input: any): string {
   return text.length > 80 ? text.slice(0, 80) + "…" : text;
 }
 
+// Some models emit user-facing narration as a `thinking` block whose signature
+// carries a "narration" marker. Claude Code renders these like normal replies,
+// so treat them as assistant text. Plain (unmarked) thinking stays hidden.
+// The marker is an undocumented detail of the signature; if it changes, these
+// blocks are simply not shown (same as before).
+export function isNarration(b: any): boolean {
+  if (b?.type !== "thinking" || typeof b.thinking !== "string" || !b.thinking.trim()) return false;
+  try {
+    return Buffer.from(String(b.signature ?? "").slice(0, 200), "base64").includes("narration");
+  } catch {
+    return false;
+  }
+}
+
 // Every herdr call is killed after `timeout` ms so a hung herdr cannot pile up processes.
 async function herdr(timeout: number, ...cmd: string[]): Promise<any> {
   return (await runJson(["herdr", ...cmd], timeout)) ?? { error: { code: "herdr_failed" } };
@@ -229,6 +243,8 @@ export async function startServer(opts: ServerOptions) {
       for (const b of content) {
         if (b.type === "text" && b.text.trim()) {
           broadcast("message", { role: "assistant", text: b.text, ts: d.timestamp });
+        } else if (isNarration(b)) {
+          broadcast("message", { role: "assistant", text: b.thinking, ts: d.timestamp, narration: true });
         } else if (b.type === "tool_use") {
           const t = { id: b.id, name: b.name, summary: toolSummary(b.input), ts: d.timestamp };
           pendingTools.set(b.id, t);
