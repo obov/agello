@@ -38,15 +38,18 @@ Run inside the herdr pane where the agent is running (`$HERDR_PANE_ID` is picked
 
 ```sh
 agello start --open      # start in the background and open the page
-agello status            # list running servers
-agello stop              # stop
+agello status            # list running servers (pane, agent state, screen browser)
+agello stop              # stop this pane's server
 ```
 
 Or target another pane:
 
 ```sh
-agello start --pane w1:p2 --port 8766
+agello start --pane w1:p2
+agello stop --pane w1:p2
 ```
+
+One server per pane. `start` reuses the pane's server if it is already running, and otherwise picks the first free port from 8765 (so servers for different panes never collide). The screen panel only uses the terminal-browser given with `--browser` or the one in the agent's own herdr tab, never another tab's.
 
 Messages sent from the page arrive in the agent as:
 
@@ -61,11 +64,11 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 | Command | Description |
 |---|---|
 | `agello start [options]` | Start a server in the background |
-| `agello stop [--port N \| --all]` | Stop a server |
-| `agello status [--json]` | List running servers and agent state |
-| `agello open [--port N]` | Open the page in the default browser |
+| `agello stop [--port N \| --pane ID \| --all]` | Stop a server (default: this pane's) |
+| `agello status [--json]` | List running servers, agent state and screen browser |
+| `agello open [--port N \| --pane ID]` | Open the page (default: this pane's server) |
 
-`start` options: `--pane <id>`, `--port <n>` (default 8765), `--session <id>`, `--browser <terminal-browser key>`, `--allow-origin <origin>` (repeatable), `--open`, `--foreground`.
+`start` options: `--pane <id>`, `--port <n>` (default: first free from 8765), `--session <id>`, `--browser <terminal-browser key>`, `--allow-origin <origin>` (repeatable), `--open`, `--foreground`.
 
 State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
 

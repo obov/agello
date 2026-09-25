@@ -185,5 +185,12 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     ws.send(JSON.stringify({ id: ++msgId, method: m.method, params: m.params ?? {} }));
   }
 
-  return { handle, input };
+  // Which browser the relay uses (or would use), for status reporting.
+  async function describe(): Promise<ScreenMeta> {
+    if (meta.connected) return meta;
+    const { browser, reason } = await pickBrowser();
+    return browser ? { connected: false, browser: browser.key } : { connected: false, reason };
+  }
+
+  return { handle, input, describe };
 }

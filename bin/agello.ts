@@ -3,6 +3,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readdirSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -11,22 +12,23 @@ import { startServer } from "../src/server.ts";
 
 const NAME = "agello";
 const DEFAULT_PORT = 8765;
+const PORT_RANGE_END = 8799; // auto-picked ports: DEFAULT_PORT..PORT_RANGE_END
 const STATE_DIR = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), NAME);
 
 const HELP = `${NAME} ${pkg.version}: talk to a coding agent in a herdr pane from the browser
 
 Usage:
-  ${NAME} start [options]      Start a bridge server in the background
-  ${NAME} stop [--port N|--all] Stop a running server
+  ${NAME} start [options]      Start a bridge server for a pane in the background
+  ${NAME} stop [--port N|--pane ID|--all]  Stop a server (default: this pane's)
   ${NAME} status [--json]      List running servers
-  ${NAME} open [--port N]      Open the bridge page in the default browser
+  ${NAME} open [--port N|--pane ID]        Open the page (default: this pane's server)
   ${NAME} help | --version
 
 start options:
   --pane <id>            herdr pane of the agent (default: $HERDR_PANE_ID)
-  --port <n>             port (default: ${DEFAULT_PORT})
+  --port <n>             port (default: first free port from ${DEFAULT_PORT})
   --session <id>         expected agent session id (default: session seen at start)
-  --browser <key>        terminal-browser key for the screen panel (default: same herdr tab)
+  --browser <key>        terminal-browser key for the screen panel (default: the one in the same herdr tab)
   --allow-origin <o>     extra allowed origin for embedding, repeatable ("null" for file://)
   --open                 open the page after starting
   --foreground           run in this process instead of the background
@@ -40,6 +42,7 @@ type Instance = {
   port: number;
   pane: string;
   session?: string;
+  browser?: string; // --browser given at start (unset: same herdr tab)
   url: string;
   log: string;
   startedAt: string;
@@ -89,6 +92,33 @@ async function fetchStatus(url: string): Promise<any | null> {
   }
 }
 
+function portFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const s = createServer();
+    s.once("error", () => resolve(false));
+    s.listen(port, "127.0.0.1", () => s.close(() => resolve(true)));
+  });
+}
+
+// Which server a stop/open without --all targets: --port, else --pane,
+// else this pane's ($HERDR_PANE_ID), else the only running one.
+async function resolveTarget(o: { port?: string; pane?: string }): Promise<Instance> {
+  const all = await listInstances();
+  if (o.port) {
+    const i = all.find((x) => x.port === Number(o.port));
+    return i ?? fail(`nothing running on port ${o.port}`);
+  }
+  const pane = o.pane ?? process.env.HERDR_PANE_ID;
+  if (pane) {
+    const i = all.find((x) => x.pane === pane);
+    if (i) return i;
+    if (o.pane) fail(`nothing running for pane ${pane}`);
+  }
+  if (all.length === 1) return all[0];
+  if (!all.length) fail(`not running; run \`${NAME} start\``);
+  return fail(`several servers running; pass --port or --pane:\n${all.map((i) => `  ${i.url}  pane=${i.pane}`).join("\n")}`);
+}
+
 function openUrl(url: string) {
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
   Bun.spawn([cmd, url], { stdout: "ignore", stderr: "ignore" });
@@ -106,7 +136,7 @@ async function cmdStart(argv: string[]) {
     args: argv,
     options: {
       pane: { type: "string", default: process.env.HERDR_PANE_ID },
-      port: { type: "string", default: String(DEFAULT_PORT) },
+      port: { type: "string" },
       session: { type: "string" },
       browser: { type: "string" },
       "allow-origin": { type: "string", multiple: true, default: [] },
@@ -114,16 +144,31 @@ async function cmdStart(argv: string[]) {
       foreground: { type: "boolean", default: false },
     },
   });
-  const port = Number(o.port);
   if (!o.pane) fail("--pane is required (HERDR_PANE_ID is not set; run inside herdr or pass --pane)");
   if (!Bun.which("herdr")) fail("herdr not found on PATH");
   mkdirSync(STATE_DIR, { recursive: true });
+  const pane = o.pane!;
 
-  const existing = await readInstance(port);
-  if (existing) {
-    console.log(`already running: ${existing.url} (pane ${existing.pane}, pid ${existing.pid})`);
-    if (o.open) openUrl(existing.url);
+  // One server per pane: reuse this pane's server, never another pane's.
+  const all = await listInstances();
+  const mine = all.find((i) => i.pane === pane);
+  if (mine) {
+    console.log(`already running: ${mine.url} (pane ${mine.pane}, pid ${mine.pid})`);
+    if (o.open) openUrl(mine.url);
     return;
+  }
+
+  let port: number;
+  if (o.port) {
+    port = Number(o.port);
+    const other = all.find((i) => i.port === port);
+    if (other) fail(`port ${port} is used by the server for pane ${other.pane} (${other.url}); omit --port to pick a free one`);
+    if (!(await portFree(port))) fail(`port ${port} is in use by another program`);
+  } else {
+    let found = 0;
+    for (let p = DEFAULT_PORT; p <= PORT_RANGE_END && !found; p++)
+      if (!all.some((i) => i.port === p) && (await portFree(p))) found = p;
+    port = found || fail(`no free port in ${DEFAULT_PORT}-${PORT_RANGE_END}; pass --port`);
   }
 
   if (o.foreground) {
@@ -139,6 +184,7 @@ async function cmdStart(argv: string[]) {
       port,
       pane: srv.pane,
       session: srv.session,
+      browser: o.browser,
       url: srv.url,
       log: logPath(port),
       startedAt: new Date().toISOString(),
@@ -157,7 +203,10 @@ async function cmdStart(argv: string[]) {
   }
 
   // Background: re-run this CLI with --foreground, detached, logging to a file.
-  const args = argv.filter((a) => a !== "--open");
+  const args = ["--pane", pane, "--port", String(port)];
+  if (o.session) args.push("--session", o.session);
+  if (o.browser) args.push("--browser", o.browser);
+  for (const origin of o["allow-origin"] as string[]) args.push("--allow-origin", origin);
   const log = openSync(logPath(port), "a");
   const child = spawn(process.execPath, [import.meta.path, "start", "--foreground", ...args], {
     detached: true,
@@ -171,7 +220,7 @@ async function cmdStart(argv: string[]) {
   while (Date.now() < deadline) {
     if (child.exitCode !== null || !isAlive(child.pid!)) fail(`server exited; see ${logPath(port)}`);
     if ((await readInstance(port)) && (await fetchStatus(url))) {
-      console.log(`started: ${url} (pane ${o.pane}, pid ${child.pid})`);
+      console.log(`started: ${url} (pane ${pane}, pid ${child.pid})`);
       console.log(`log: ${logPath(port)}`);
       if (o.open) openUrl(url);
       return;
@@ -184,11 +233,9 @@ async function cmdStart(argv: string[]) {
 async function cmdStop(argv: string[]) {
   const { values: o } = parseArgs({
     args: argv,
-    options: { port: { type: "string" }, all: { type: "boolean", default: false } },
+    options: { port: { type: "string" }, pane: { type: "string" }, all: { type: "boolean", default: false } },
   });
-  const targets = o.all
-    ? await listInstances()
-    : [await readInstance(Number(o.port ?? DEFAULT_PORT))].filter((i): i is Instance => !!i);
+  const targets = o.all ? await listInstances() : [await resolveTarget(o)];
   if (!targets.length) {
     console.log("not running");
     return;
@@ -219,16 +266,17 @@ async function cmdStatus(argv: string[]) {
     const a = r.agent;
     const state = !a ? "unreachable" : a.alive ? a.status : `dead (${a.reason})`;
     const name = a?.label ? `${a.label} (${r.pane})` : r.pane;
-    console.log(`${r.url}  pane=${name}  agent=${state}  pid=${r.pid}`);
+    const scr = a?.screen;
+    const browser = scr?.browser ?? (scr?.reason ? `none (${scr.reason})` : "unknown");
+    console.log(`${r.url}  pane=${name}  agent=${state}  browser=${browser}  pid=${r.pid}`);
   }
 }
 
 async function cmdOpen(argv: string[]) {
-  const { values: o } = parseArgs({ args: argv, options: { port: { type: "string" } } });
-  const inst = await readInstance(Number(o.port ?? DEFAULT_PORT));
-  if (!inst) fail(`not running on port ${o.port ?? DEFAULT_PORT}; run \`${NAME} start\``);
-  openUrl(inst!.url);
-  console.log(inst!.url);
+  const { values: o } = parseArgs({ args: argv, options: { port: { type: "string" }, pane: { type: "string" } } });
+  const inst = await resolveTarget(o);
+  openUrl(inst.url);
+  console.log(inst.url);
 }
 
 // ---------- main ----------

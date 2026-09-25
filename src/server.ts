@@ -357,7 +357,7 @@ export async function startServer(opts: ServerOptions) {
   async function route(req: Request, url: URL): Promise<Response> {
     switch (url.pathname) {
       case "/status":
-        return Response.json(await checkStatus());
+        return Response.json({ ...(await checkStatus()), browser: opts.browser, screen: await screen.describe() });
       case "/events":
         return events();
       case "/screen":
