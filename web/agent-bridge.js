@@ -47,6 +47,12 @@ const REASONS = {
   session_changed: "다른 세션으로 교체됨",
 };
 const STATES = { idle: "대기 중", working: "작업 중", blocked: "입력 대기", done: "완료", unknown: "상태 불명" };
+const SCREEN_REASONS = {
+  browser_not_found: "지정한 terminal-browser(--browser)를 찾을 수 없음",
+  no_browser_in_tab: "이 herdr 탭에 열린 terminal-browser 없음",
+  tab_unknown: "에이전트의 herdr 탭을 확인할 수 없음",
+  no_active_tab: "브라우저에 활성 탭 없음",
+};
 const ACTIONS = { message: "메시지", approve: "승인", reject: "거절" };
 
 const CSS = `
@@ -519,6 +525,7 @@ class AgentBridge extends HTMLElement {
   #renderScreenMeta(m) {
     const { live, url, viewport } = this.$;
     if (!m.connected) {
+      this.$.viewport.querySelector(".placeholder").textContent = SCREEN_REASONS[m.reason] || "열린 terminal-browser 없음";
       live.hidden = true;
       url.textContent = "";
       viewport.classList.remove("has", "agent");

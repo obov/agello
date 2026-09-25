@@ -16,6 +16,7 @@ type Browser = {
 
 export type ScreenMeta = {
   connected: boolean;
+  reason?: "browser_not_found" | "no_browser_in_tab" | "tab_unknown" | "no_active_tab";
   browser?: string;
   url?: string;
   title?: string;
@@ -53,11 +54,20 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     return (await runJson(["terminal-browser", "ls", "--all", "--json"], 3000))?.browsers ?? [];
   }
 
-  async function pickBrowser(): Promise<Browser | undefined> {
+  // Only ever relay (and forward input to) the intended browser: the one given
+  // with --browser, or one in the agent's own herdr tab. Never fall back to
+  // another tab's browser: that would expose another agent's screen and let
+  // "my control" type into it.
+  async function pickBrowser(): Promise<{ browser?: Browser; reason?: ScreenMeta["reason"] }> {
     const all = await listBrowsers();
-    if (opts.browserKey) return all.find((b) => b.key === opts.browserKey);
+    if (opts.browserKey) {
+      const browser = all.find((b) => b.key === opts.browserKey);
+      return browser ? { browser } : { reason: "browser_not_found" };
+    }
     const tab = await opts.herdrTab?.();
-    return all.find((b) => b.pane?.tab === tab) ?? all[0];
+    if (!tab) return { reason: "tab_unknown" };
+    const browser = all.find((b) => b.pane?.tab === tab);
+    return browser ? { browser } : { reason: "no_browser_in_tab" };
   }
 
   function disconnect() {
@@ -107,12 +117,12 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
   }
 
   async function syncOnce() {
-    const b = await pickBrowser();
+    const { browser: b, reason } = await pickBrowser();
     const tab = b?.tabs.find((t) => t.active);
     if (!b || !tab) {
       disconnect();
       lastFrame = null;
-      setMeta({ connected: false });
+      setMeta({ connected: false, reason: reason ?? "no_active_tab" });
       return;
     }
     const url = `ws://127.0.0.1:${b.cdpPort}/devtools/page/${tab.targetId}`;
