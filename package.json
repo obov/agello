@@ -2,6 +2,23 @@
   "name": "agello",
   "version": "0.1.0",
   "description": "Talk to a coding agent in a herdr pane from the browser: chat, live status, and a shared browser screen.",
+  "keywords": [
+    "herdr",
+    "claude-code",
+    "coding-agent",
+    "browser",
+    "bridge",
+    "cli",
+    "bun"
+  ],
+  "homepage": "https://github.com/obov/agello#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/obov/agello.git"
+  },
+  "bugs": {
+    "url": "https://github.com/obov/agello/issues"
+  },
   "type": "module",
   "bin": {
     "agello": "bin/agello.ts"

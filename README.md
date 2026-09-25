@@ -19,9 +19,17 @@ Currently supports **Claude Code** sessions.
 ## Install
 
 ```sh
+bun add -g agello      # or: npm i -g agello  (Bun is still required to run it)
+```
+
+Or run without installing: `bunx agello start --open`
+
+From source:
+
+```sh
 git clone https://github.com/obov/agello
 cd agello
-bun link        # puts `agello` on your PATH
+bun link               # puts `agello` on your PATH
 ```
 
 ## Usage
