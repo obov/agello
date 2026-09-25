@@ -1,6 +1,6 @@
 {
   "name": "agello",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Talk to a coding agent in a herdr pane from the browser: chat, live status, and a shared browser screen.",
   "keywords": [
     "herdr",
@@ -31,5 +31,9 @@
   "engines": {
     "bun": ">=1.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0"
+  }
 }

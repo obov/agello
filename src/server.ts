@@ -6,12 +6,14 @@
 // GET  /events           SSE: status, chat messages, tool start/end (from transcript JSONL)
 // POST /send             {action, text} -> herdr agent prompt
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
+// WS   /terminal         interactive herdr terminal frames, keyboard input, resize
 // WS   /input            user control: CDP Input.* commands forwarded to the page
 // GET  /present          presentation state
 // POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
 //                        ({stop: true, from: "viewer"}: ended from the page, the agent is told
 //                         with "[browser] action=present-stop")
 
+import { createTerminal, type SocketData } from "./terminal.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
@@ -103,6 +105,12 @@ export async function startServer(opts: ServerOptions) {
   const ALLOW_ORIGINS = opts.allowOrigins ?? [];
   const HTML = Bun.file(join(WEB_DIR, "index.html"));
   const COMPONENT = Bun.file(join(WEB_DIR, "agent-bridge.js"));
+
+  const terminal = createTerminal(PANE);
+  const bundle = await Bun.build({ entrypoints: [join(WEB_DIR, "terminal.js")], target: "browser", minify: true });
+  if (!bundle.success) throw new Error(`Terminal bundle failed: ${bundle.logs.join("\n")}`);
+  const terminalJS = await bundle.outputs[0].text();
+  const terminalCSS = Bun.file(new URL(import.meta.resolve("@xterm/xterm/css/xterm.css")));
 
   const agentInfo = async (): Promise<any | null> =>
     (await herdr(3000, "agent", "get", PANE))?.result?.agent ?? null;
@@ -422,6 +430,10 @@ export async function startServer(opts: ServerOptions) {
         return events();
       case "/screen":
         return screen.handle();
+      case "/terminal.js":
+        return new Response(terminalJS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
+      case "/terminal.css":
+        return new Response(terminalCSS, { headers: { "Content-Type": "text/css; charset=utf-8" } });
       case "/agent-bridge.js":
         return new Response(COMPONENT, {
           headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" },
@@ -435,19 +447,23 @@ export async function startServer(opts: ServerOptions) {
     return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
   }
 
-  const server = Bun.serve({
+  const server = Bun.serve<SocketData>({
     hostname: "127.0.0.1",
     port: opts.port,
     idleTimeout: 0, // keep SSE open
     websocket: {
-      message(_ws, msg) {
-        screen.input(String(msg));
+      maxPayloadLength: 128 * 1024,
+      open(ws) { if (ws.data.kind === "terminal") terminal.open(ws); },
+      message(ws, msg) {
+        if (ws.data.kind === "terminal") terminal.message(ws, String(msg));
+        else screen.input(String(msg));
       },
+      close(ws) { if (ws.data.kind === "terminal") terminal.close(ws); },
     },
     async fetch(req, server) {
       const url = new URL(req.url);
       const origin = req.headers.get("Origin");
-      const isScript = url.pathname === "/agent-bridge.js";
+      const isScript = ["/agent-bridge.js", "/terminal.js", "/terminal.css"].includes(url.pathname);
 
       // The component script itself is public; data and input endpoints are origin-checked.
       if (!isScript && !originAllowed(origin, url.origin))
@@ -466,8 +482,9 @@ export async function startServer(opts: ServerOptions) {
           origin,
         );
 
-      if (url.pathname === "/input")
-        return server.upgrade(req) ? undefined : new Response("websocket required", { status: 426 });
+      if (url.pathname === "/input" || url.pathname === "/terminal")
+        return server.upgrade(req, { data: { kind: url.pathname === "/terminal" ? "terminal" : "screen" } })
+          ? undefined : new Response("websocket required", { status: 426 });
 
       const res = await route(req, url);
       return isScript ? (res.headers.set("Access-Control-Allow-Origin", "*"), res) : withCors(res, origin);
@@ -480,6 +497,7 @@ export async function startServer(opts: ServerOptions) {
     session: SESSION,
     transcript,
     stop() {
+      terminal.stop();
       timers.forEach(clearInterval);
       server.stop(true);
     },

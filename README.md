@@ -5,15 +5,16 @@
 - Chat with the agent from a web page; terminal input, browser input and agent replies are shown as separate bubbles
 - Live session status, tool activity, and prompts queued while the agent is busy (same order as the terminal)
 - Conversation saved per pane in the browser, kept across reloads
+- Interactive terminal view of the existing herdr pane: live cursor, keyboard input, and automatic resize
 - Optional live view of a `terminal-browser` screen, with an on/off switch to control it yourself
 - Embeddable `<agent-bridge>` web component
 
-Currently supports **Claude Code** sessions.
+Chat currently supports **Claude Code** sessions. The terminal view connects directly to the pane, including ordinary shells and other terminal applications.
 
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.1
-- [herdr](https://herdr.dev) (the agent must run inside a herdr pane)
+- [herdr](https://herdr.dev) (the agent must run inside a herdr pane); interactive terminal view requires `herdr terminal session control`
 - Optional: `terminal-browser` for the screen panel
 
 ## Install
@@ -74,6 +75,14 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 
 State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
 
+### Interactive terminal
+
+Click the terminal icon in the header to replace the chat with the pane's live terminal (the screen panel stays). Keyboard input (including Korean text, arrow keys, and Ctrl+C) goes directly to that terminal. The viewport follows the browser size, and the mouse wheel scrolls through Herdr. Click the icon again or close the page to release control; the pane and its process keep running. If disconnected, use **다시 연결** to restore the current screen.
+
+Only one browser connection can control a pane through this server at a time. Agello never forcibly takes over another Herdr controller. While connected, resizing the browser also changes the source terminal size. Terminal input is raw input, without the chat's `[browser]` prefix.
+
+The xterm.js renderer and its styles are served locally; no terminal CDN is required. Herdr sends an initial ANSI screen and subsequent frame updates over the WebSocket, including cursor state. Terminal frames are not stored in browser chat history.
+
 ### Presentation mode
 
 `agello present x,y,w,h` (CSS px of the browser's visible viewport; omit for the whole screen):
@@ -110,11 +119,16 @@ See `web/embed-example.html`.
 - **Send**: `herdr agent prompt <pane> "<text>"` (kept to 3 lines so Claude Code does not treat it as a paste)
 - **Status**: `herdr agent get` / `herdr pane get`, polled every 1.5s
 - **Chat**: tails the Claude Code transcript (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`) and streams it over SSE
+- **Terminal**: `/terminal` WebSocket relays `herdr terminal session control <pane>` ANSI frames and validated input, resize, and scroll commands to xterm.js
 - **Screen**: finds the terminal-browser CDP port via `terminal-browser ls --json` and relays `Page.startScreencast` frames; user control forwards `Input.*` events only
 
 ## Security
 
-The server listens on `127.0.0.1` only. Data and input endpoints accept requests from the same origin and `localhost` pages only; other origins get `403` unless added with `--allow-origin`. Anything allowed to post to `/send` can type into your agent session, so keep the allow list short.
+The server listens on `127.0.0.1` only. Data and input endpoints accept requests from the same origin and `localhost` pages only; other origins get `403` unless added with `--allow-origin`. Allowed origins can send chat prompts and connect to `/terminal` to type directly into the pane, so keep the allow list short.
+
+## Development
+
+Run `bun install` and `bun test`. Tests cover local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, and reconnect.
 
 ## License
 

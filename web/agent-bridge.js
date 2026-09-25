@@ -73,6 +73,18 @@ const ACTIONS = {
 };
 
 const CSS = `
+.term-btn { display: inline-flex; align-items: center; justify-content: center; padding: 3px 7px; border-radius: 999px; }
+.term-btn svg { width: 14px; height: 14px; }
+.term-btn[aria-pressed="true"] { background: var(--_accent); border-color: var(--_accent); color: white; }
+.terminal-panel { display: none; flex: 1; min-height: 0; flex-direction: column; background: #101114; }
+:host([terminal-open]) .chat > .stage, :host([terminal-open]) .chat > footer { display: none; }
+:host([terminal-open]) .terminal-panel { display: flex; }
+.terminal-bar { display: flex; gap: 8px; align-items: center; padding: 6px 12px; border-bottom: 1px solid #26272b; }
+.terminal-status { flex: 1; font-size: 12px; color: #a1a1aa; overflow-wrap: anywhere; }
+.terminal-retry { font-size: 11px; padding: 2px 9px; border-radius: 999px; }
+.terminal-host { flex: 1; min-height: 0; padding: 8px 12px; overflow: hidden; }
+.terminal-host textarea { min-height: 0; border: 0; padding: 0; resize: none; }
+
 :host {
   --_bg: var(--ab-bg, #f6f6f4); --_panel: var(--ab-panel, #fff); --_text: var(--ab-text, #1f1f1f);
   --_muted: var(--ab-muted, #6b6b6b); --_line: var(--ab-line, #e4e4e0); --_accent: var(--ab-accent, #2f6fed);
@@ -306,8 +318,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 `;
 
 const TEMPLATE = `
-<header><h1 part="heading"></h1><div class="session"><button class="clear-btn" title="이 pane의 저장된 대화 삭제">기록 지우기</button><span class="dot"></span><span class="state">연결 중</span></div></header>
+<header><h1 part="heading"></h1><div class="session"><button class="term-btn" aria-pressed="false" title="터미널에서 실행 중인 세션 보기 (다시 누르면 채팅)" aria-label="터미널"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button><button class="clear-btn" title="이 pane의 저장된 대화 삭제">기록 지우기</button><span class="dot"></span><span class="state">연결 중</span></div></header>
 <div class="body"><section class="chat">
+<div class="terminal-panel" aria-label="터미널"><div class="terminal-bar"><span class="terminal-status" role="status"></span><button class="terminal-retry">다시 연결</button></div><div class="terminal-host"></div></div>
 <div class="stage">
 <div class="log" part="log"><div class="inner"><div class="empty">이 pane의 대화가 브라우저에 저장돼요.</div></div><div class="inner queue" part="queue"></div></div>
 <div class="activity" part="activity"></div>
@@ -347,6 +360,9 @@ class AgentBridge extends HTMLElement {
   #es = null;
   #screenEs = null;
   #controlWs = null;
+  #terminalCleanup = null;
+  #terminalVersion = 0;
+  #terminalStyles = null;
   #frame = { w: 0, h: 0 };
   #moveQueued = null;
   #status = null;
@@ -383,6 +399,8 @@ class AgentBridge extends HTMLElement {
     loadMarkdown().then((md) => (this.#md = md));
     this.#bindControl();
     this.#bindHand();
+    q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
+    q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
     this.$.clearBtn.addEventListener("click", () => this.clearHistory());
   }
 
@@ -396,6 +414,7 @@ class AgentBridge extends HTMLElement {
     this.#syncScreen();
   }
   disconnectedCallback() {
+    this.#showTerminal(false);
     this.#es?.close();
     this.#es = null;
     this.#screenEs?.close();
@@ -404,8 +423,39 @@ class AgentBridge extends HTMLElement {
   }
   attributeChangedCallback(name) {
     if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "agello";
-    if (name === "server" && this.isConnected) { this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
+    if (name === "server" && this.isConnected) { this.#showTerminal(false); this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
     if (name === "screen" && this.isConnected) this.#syncScreen();
+  }
+
+  async #showTerminal(on) {
+    const version = ++this.#terminalVersion;
+    this.#terminalCleanup?.();
+    this.#terminalCleanup = null;
+    this.toggleAttribute("terminal-open", on);
+    const q = (s) => this.#root.querySelector(s);
+    q(".term-btn").setAttribute("aria-pressed", String(on));
+    if (!on) return;
+    this.#setControl(false);
+    q(".terminal-status").textContent = "터미널 로딩 중…";
+    try {
+      if (!this.#terminalStyles) {
+        const link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = `${SCRIPT_ORIGIN}/terminal.css`;
+        link.dataset.terminalCss = "";
+        this.#terminalStyles = new Promise((resolve, reject) => {
+          link.onload = resolve;
+          link.onerror = () => { this.#terminalStyles = null; link.remove(); reject(new Error("Stylesheet failed")); };
+        });
+        this.#root.append(link);
+      }
+      await this.#terminalStyles;
+      const { mountTerminal } = await import(`${SCRIPT_ORIGIN}/terminal.js`);
+      if (version !== this.#terminalVersion || !this.isConnected) return;
+      this.#terminalCleanup = mountTerminal(q(".terminal-host"), q(".terminal-status"), this.server);
+    } catch {
+      if (version === this.#terminalVersion) q(".terminal-status").textContent = "터미널을 불러오지 못했습니다. 다시 연결해 주세요.";
+    }
   }
 
   async send(text, action = "message") {
@@ -499,7 +549,7 @@ class AgentBridge extends HTMLElement {
     this.#present = p ?? { on: false };
     this.#emit("agent-present", this.#present);
     if (on === was) return;
-    if (on) this.#setControl(false);
+    if (on) { this.#showTerminal(false); this.#setControl(false); }
     else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#handUp = false; }
     this.#syncScreen();
     // FLIP: grow from (or shrink back to) the side panel
