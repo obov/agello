@@ -14,6 +14,9 @@ type Browser = {
   tabs: { id: number; url: string; title: string; active: boolean; targetId: string; agentControlled: boolean }[];
 };
 
+// Presentation crop: a rectangle of the visible viewport, in CSS pixels.
+export type Rect = { x: number; y: number; w: number; h: number };
+
 export type ScreenMeta = {
   connected: boolean;
   reason?: "browser_not_found" | "no_browser_in_tab" | "tab_unknown" | "no_active_tab";
@@ -28,11 +31,15 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
   const enc = new TextEncoder();
 
   let meta: ScreenMeta = { connected: false };
-  let lastFrame: { data: string; w: number; h: number } | null = null;
+  type Frame = { data: string; w: number; h: number; clip?: Rect };
+  let lastFrame: Frame | null = null; // full screencast frame
+  let lastCrop: Frame | null = null; // cropped frame while a clip is set
+  let clip: Rect | null = null;
   let ws: WebSocket | null = null;
   let wsTarget = "";
   let msgId = 0;
   let timer: Timer | null = null;
+  const pending = new Map<number, (result: any) => void>();
 
   const emit = (c: ReadableStreamDefaultController, event: string, data: unknown) => {
     try {
@@ -74,6 +81,63 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     ws?.close();
     ws = null;
     wsTarget = "";
+    pending.forEach((r) => r(null));
+    pending.clear();
+  }
+
+  // CDP call that resolves with the result (null on error or closed socket).
+  function request(method: string, params: object = {}): Promise<any> {
+    const sock = ws;
+    if (!sock || sock.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const id = ++msgId;
+      const t = setTimeout(() => pending.delete(id) && resolve(null), 5000);
+      pending.set(id, (r) => (clearTimeout(t), resolve(r)));
+      sock.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  // While a clip is set, only the clipped region is sent to viewers: every
+  // screencast frame (= the page changed) triggers one Page.captureScreenshot
+  // of the rectangle at full device resolution. At most one capture runs at a
+  // time; changes during a capture are coalesced into one more capture.
+  let capturing = false;
+  let dirty = false;
+  async function capture() {
+    if (!clip) return;
+    if (capturing) {
+      dirty = true;
+      return;
+    }
+    capturing = true;
+    try {
+      do {
+        dirty = false;
+        const c = clip;
+        if (!c) break;
+        // clip coordinates are document-relative; the rect is viewport-relative
+        const vv = (await request("Page.getLayoutMetrics"))?.cssVisualViewport;
+        if (!vv) break;
+        const shot = await request("Page.captureScreenshot", {
+          format: "jpeg",
+          quality: 85,
+          clip: { x: c.x + vv.pageX, y: c.y + vv.pageY, width: c.w, height: c.h, scale: 1 },
+        });
+        if (!shot?.data || clip !== c) continue;
+        lastCrop = { data: shot.data, w: c.w, h: c.h, clip: c };
+        broadcast("frame", lastCrop);
+        await Bun.sleep(100); // cap at ~10 captures/s
+      } while (dirty && clip);
+    } finally {
+      capturing = false;
+    }
+  }
+
+  function setClip(next: Rect | null) {
+    clip = next;
+    lastCrop = null;
+    if (clip) capture();
+    else if (lastFrame) broadcast("frame", lastFrame);
   }
 
   function connect(port: number, targetId: string) {
@@ -88,14 +152,22 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     sock.onopen = () => {
       call("Page.enable");
       call("Page.startScreencast", { format: "jpeg", quality: 70, maxWidth: 1600, maxHeight: 1600 });
+      if (clip) capture();
     };
     sock.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data));
+      if (msg.id && pending.has(msg.id)) {
+        const resolve = pending.get(msg.id)!;
+        pending.delete(msg.id);
+        resolve(msg.result ?? null);
+        return;
+      }
       if (msg.method !== "Page.screencastFrame") return;
       const { data, metadata, sessionId } = msg.params;
       call("Page.screencastFrameAck", { sessionId });
       lastFrame = { data, w: metadata.deviceWidth, h: metadata.deviceHeight };
-      broadcast("frame", lastFrame);
+      if (clip) capture();
+      else broadcast("frame", lastFrame);
     };
     sock.onclose = () => {
       if (ws === sock) {
@@ -122,6 +194,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     if (!b || !tab) {
       disconnect();
       lastFrame = null;
+      lastCrop = null;
       setMeta({ connected: false, reason: reason ?? "no_active_tab" });
       return;
     }
@@ -146,6 +219,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     timer = null;
     disconnect();
     lastFrame = null;
+    lastCrop = null;
     meta = { connected: false };
   }
 
@@ -158,7 +232,8 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
         ctrl = c;
         viewers.add(c);
         emit(c, "meta", meta);
-        if (lastFrame) emit(c, "frame", lastFrame);
+        const f = clip ? lastCrop : lastFrame;
+        if (f) emit(c, "frame", f);
         ping = setInterval(() => emit(c, "ping", {}), 15000);
         start();
       },
@@ -181,7 +256,8 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     } catch {
       return;
     }
-    if (!INPUT_METHODS.has(m?.method) || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // input coordinates assume the full frame: ignore input while cropped
+    if (clip || !INPUT_METHODS.has(m?.method) || !ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ id: ++msgId, method: m.method, params: m.params ?? {} }));
   }
 
@@ -192,5 +268,5 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     return browser ? { connected: false, browser: browser.key } : { connected: false, reason };
   }
 
-  return { handle, input, describe };
+  return { handle, input, describe, setClip };
 }

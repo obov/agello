@@ -67,10 +67,25 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 | `agello stop [--port N \| --pane ID \| --all]` | Stop a server (default: this pane's) |
 | `agello status [--json]` | List running servers, agent state and screen browser |
 | `agello open [--port N \| --pane ID]` | Open the page (default: this pane's server) |
+| `agello present [x,y,w,h] [--port N \| --pane ID]` | Presentation mode (see below) |
+| `agello present stop` | End presentation mode |
 
 `start` options: `--pane <id>`, `--port <n>` (default: first free from 8765), `--session <id>`, `--browser <terminal-browser key>`, `--allow-origin <origin>` (repeatable), `--open`, `--foreground`.
 
 State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
+
+### Presentation mode
+
+`agello present x,y,w,h` (CSS px of the browser's visible viewport; omit for the whole screen):
+
+- only that rectangle is sent to the page (`Page.captureScreenshot` with a clip, at device resolution)
+- the screen panel expands to fill the window
+- agent replies appear over it as bubbles that fade after 10s
+- `agello present stop` returns to the normal layout; the replies are in the chat as usual
+- the viewer can ask a question with the raise-hand button (its bubble fades after 10s too) or end the presentation with the end button; the agent then receives `[browser] action=present-stop`
+- raising the hand tells the agent at once (`action=hand-raise`) so it can pause; closing the input without asking sends `action=hand-lower`
+
+Run `present` again to move the crop. User control is off while presenting.
 
 ## Embed
 

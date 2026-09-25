@@ -23,10 +23,24 @@
 //   agent-tool     detail: { phase: 'start'|'end', id, name?, summary?, isError? }
 //                  (tool calls are also kept in the conversation as one-line rows, like the terminal)
 //   agent-screen   detail: { connected, browser?, url?, title?, agentControlled? }
+//   agent-present  detail: { on, rect?: {x,y,w,h}, since? }
+//
+// Presentation mode (started by the agent: `agello present [x,y,w,h]`)
+//   The screen panel expands to fill the window and shows only the given
+//   rectangle of the browser. Agent replies appear over it as bubbles that fade
+//   after 10s; they are also added to the chat, so it is all there when the
+//   presentation ends. User control is off while presenting.
+//   A raise-hand button next to the bubbles opens a small input so the viewer
+//   can ask the agent something mid-presentation (sent as action=message).
+//   Opening it tells the agent right away (action=hand-raise) so it can pause;
+//   closing it without asking sends action=hand-lower so it can go on.
+//   The viewer's questions show as bubbles too, with the same 10s lifetime.
+//   An end button above it stops the presentation for every viewer.
 //
 // Methods
 //   el.send(text, action = 'message') -> Promise<{ok, error?}>
 //   el.clearHistory()                  clear saved chat for the current pane
+//   el.stopPresent()                   end presentation mode, tell the agent -> Promise<{ok, error?, notified?}>
 
 const SCRIPT_ORIGIN = new URL(import.meta.url).origin;
 
@@ -53,7 +67,10 @@ const SCREEN_REASONS = {
   tab_unknown: "에이전트의 herdr 탭을 확인할 수 없음",
   no_active_tab: "브라우저에 활성 탭 없음",
 };
-const ACTIONS = { message: "메시지", approve: "승인", reject: "거절" };
+const ACTIONS = {
+  message: "메시지", approve: "승인", reject: "거절",
+  "present-stop": "발표 종료", "hand-raise": "손들기", "hand-lower": "손 내림",
+};
 
 const CSS = `
 :host {
@@ -154,6 +171,60 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .control-btn:focus-visible { outline: 2px solid var(--_accent); outline-offset: 2px; border-radius: 6px; }
 @media (prefers-reduced-motion: reduce) { .control-btn .track, .control-btn .knob { transition: none; } }
 .placeholder { font-size: 13px; color: var(--_muted); text-align: center; }
+
+/* presentation mode: the screen panel covers the window, chat stays hidden underneath.
+   container-type would make the host the containing block of the fixed layer, so drop it. */
+:host([presenting]) { container-type: normal; }
+.body.present .screen { display: flex; position: fixed; inset: 0; z-index: 2147483000; border: 0;
+                        width: auto; height: auto; background: #0b0b0c; }
+.body.present .screen-bar, .body.present .ring, .body.present .glow, .body.present .agent-badge { display: none; }
+.body.present .viewport { padding: 0; background: #0b0b0c; }
+.body.present .viewport img { width: 100%; height: 100%; max-width: none; max-height: none; border-radius: 0;
+                              box-shadow: none; }
+.captions { display: none; }
+.body.present .captions { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; display: flex;
+  flex-direction: column; align-items: center; gap: 10px; padding: 0 88px 28px; pointer-events: none; }
+.caption { max-width: min(900px, 86%); padding: 12px 18px; border-radius: 16px; overflow-wrap: anywhere;
+  font-size: 18px; line-height: 1.5; color: #fff; background: rgba(20, 20, 22, .72);
+  -webkit-backdrop-filter: blur(16px) saturate(1.3); backdrop-filter: blur(16px) saturate(1.3);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, .35); animation: capIn .3s ease; }
+.caption.plain { white-space: pre-wrap; }
+.caption.user { background: color-mix(in srgb, var(--_accent) 88%, transparent); }
+.caption.out { opacity: 0; translate: 0 6px; transition: opacity .5s ease, translate .5s ease; }
+.caption > :first-child { margin-top: 0; } .caption > :last-child { margin-bottom: 0; }
+.caption p, .caption ul, .caption ol { margin: .35em 0; }
+.caption code { font-family: ui-monospace, Menlo, monospace; font-size: .85em; background: rgba(255,255,255,.14);
+                padding: 1px 5px; border-radius: 4px; }
+.caption pre { background: rgba(255,255,255,.1); padding: 8px 10px; border-radius: 8px; overflow-x: auto; }
+.caption a { color: inherit; }
+@keyframes capIn { from { opacity: 0; translate: 0 10px; } }
+
+/* raise hand: ask the agent mid-presentation */
+.hand-wrap { display: none; }
+.body.present .hand-wrap { position: absolute; right: 22px; bottom: 28px; z-index: 5; display: flex;
+  flex-direction: column; align-items: flex-end; gap: 10px; }
+.hand, .end { width: 48px; height: 48px; padding: 0; border-radius: 50%; display: grid; place-items: center;
+  color: #fff; border: 1px solid rgba(255,255,255,.18); background: rgba(20, 20, 22, .72);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  transition: background .2s ease, transform .2s ease; }
+.hand:hover, .end:hover { background: rgba(40, 40, 44, .85); transform: translateY(-2px); }
+.hand[aria-expanded="true"] { background: var(--_accent); border-color: var(--_accent); }
+.hand.sent { background: var(--_ok); border-color: var(--_ok); }
+.end:hover { background: var(--_dead); border-color: var(--_dead); }
+.end:disabled { opacity: .5; cursor: progress; }
+.hand:focus-visible, .end:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+.hand svg, .end svg { width: 22px; height: 22px; }
+.ask { width: min(420px, calc(100vw - 44px)); padding: 12px; border-radius: 16px; color: #fff;
+  background: rgba(20, 20, 22, .82); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+  box-shadow: 0 8px 30px rgba(0,0,0,.4); animation: capIn .2s ease; }
+.ask[hidden] { display: none; }
+.ask textarea { min-height: 64px; background: rgba(255,255,255,.08); color: #fff;
+  border-color: rgba(255,255,255,.16); font-size: 15px; }
+.ask textarea::placeholder { color: rgba(255,255,255,.5); }
+.ask .ask-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.ask .ask-hint { font-size: 12px; color: rgba(255,255,255,.6); flex: 1; }
+@media (prefers-reduced-motion: reduce) { .hand, .ask { transition: none; animation: none; } }
+@media (prefers-reduced-motion: reduce) { .caption { animation: none; } .caption.out { transition: none; } }
 @container (max-width: 820px) {
   .body { flex-direction: column; }
   :host([screen]) .screen { order: -1; flex: none; height: 45%; border-left: 0; border-bottom: 1px solid var(--_line); }
@@ -256,7 +327,17 @@ const TEMPLATE = `
   <div class="screen-bar"><span class="live" hidden>에이전트 조작 중</span><span class="url"></span>
     <button class="control-btn" role="switch" aria-checked="false" title="켜면 마우스와 키보드 입력이 브라우저로 전달돼요 (끄기: Shift+Esc)">
       <span>내 조작</span><span class="track"><span class="knob"></span></span><span class="state-label">OFF</span></button></div>
-  <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div></div>
+  <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div><div class="captions" part="captions" aria-live="polite"></div>
+    <div class="hand-wrap">
+      <form class="ask" part="ask" hidden><textarea aria-label="에이전트에게 질문" placeholder="에이전트에게 질문 (Enter 전송, Esc 닫기)"></textarea>
+        <div class="ask-row"><span class="ask-hint"></span><button type="submit" class="primary">보내기</button></div></form>
+      <button class="end" part="end" type="button" aria-label="발표 종료" title="발표 종료">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+      <button class="hand" part="hand" type="button" aria-expanded="false" aria-label="손들기: 에이전트에게 질문" title="손들기: 에이전트에게 질문">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
+      </button>
+    </div></div>
 </aside></div>`;
 
 class AgentBridge extends HTMLElement {
@@ -273,7 +354,10 @@ class AgentBridge extends HTMLElement {
   #md = null;
   #historyKey = null;
   #history = [];
+  #present = { on: false };
   static HISTORY_LIMIT = 500;
+  static CAPTION_MS = 10000; // presentation bubble lifetime
+  static CAPTION_MAX = 3; // bubbles on screen at once (oldest leaves early)
 
   constructor() {
     super();
@@ -285,6 +369,8 @@ class AgentBridge extends HTMLElement {
       buttons: this.#root.querySelectorAll("button[data-action]"),
       live: q(".live"), url: q(".screen-bar .url"), viewport: q(".viewport"), img: q(".viewport img"),
       controlBtn: q(".control-btn"), kbd: q(".kbd"), clearBtn: q(".clear-btn"),
+      body: q(".body"), screen: q(".screen"), captions: q(".captions"),
+      hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
     };
     this.$.buttons.forEach((b) => b.addEventListener("click", () => this.#submit(b.dataset.action)));
     this.#bindGrip();
@@ -296,6 +382,7 @@ class AgentBridge extends HTMLElement {
     });
     loadMarkdown().then((md) => (this.#md = md));
     this.#bindControl();
+    this.#bindHand();
     this.$.clearBtn.addEventListener("click", () => this.clearHistory());
   }
 
@@ -334,6 +421,19 @@ class AgentBridge extends HTMLElement {
     }
   }
 
+  async stopPresent() {
+    try {
+      const res = await fetch(`${this.server}/present`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stop: true, from: "viewer" }),
+      });
+      return await res.json();
+    } catch {
+      return { ok: false, error: "server_unreachable" };
+    }
+  }
+
   #emit(type, detail) {
     this.dispatchEvent(new CustomEvent(type, { detail, bubbles: true, composed: true }));
   }
@@ -349,7 +449,14 @@ class AgentBridge extends HTMLElement {
     on("delivered", ({ id }) => { this.#deliver(id); this.#emit("agent-queue", { phase: "delivered", id }); });
     on("unqueued", ({ id }) => { this.#unqueue(id); this.#emit("agent-queue", { phase: "unqueued", id }); });
     on("status", (s) => this.#renderStatus(s));
-    on("message", (m) => { this.#addMessage(m); this.#saveMessage(m); this.#emit("agent-message", m); });
+    on("message", (m) => {
+      this.#addMessage(m);
+      this.#saveMessage(m);
+      if (this.#present.on && m.role === "assistant") this.#caption(m.text);
+      if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
+      this.#emit("agent-message", m);
+    });
+    on("present", (p) => this.#setPresent(p));
     on("tool_start", (t) => {
       this.#tools.set(t.id, t);
       this.#renderActivity();
@@ -366,11 +473,11 @@ class AgentBridge extends HTMLElement {
       this.#setToolState(t.id, t.isError ? "error" : "done");
       this.#emit("agent-tool", { phase: "end", ...t });
     });
-    es.onerror = () => this.#renderStatus(null);
+    es.onerror = () => { this.#renderStatus(null); this.#setPresent({ on: false }); };
   }
 
   #syncScreen() {
-    const want = this.hasAttribute("screen");
+    const want = this.hasAttribute("screen") || this.#present.on;
     if (!want) { this.#screenEs?.close(); this.#screenEs = null; this.#setControl(false); return; }
     if (this.#screenEs) return;
     const es = (this.#screenEs = new EventSource(`${this.server}/screen`));
@@ -382,6 +489,110 @@ class AgentBridge extends HTMLElement {
       this.$.viewport.classList.add("has");
     });
     es.onerror = () => this.#renderScreenMeta({ connected: false });
+  }
+
+  // ---------- presentation mode ----------
+
+  #setPresent(p) {
+    const on = !!p?.on;
+    const was = this.#present.on;
+    this.#present = p ?? { on: false };
+    this.#emit("agent-present", this.#present);
+    if (on === was) return;
+    if (on) this.#setControl(false);
+    else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#handUp = false; }
+    this.#syncScreen();
+    // FLIP: grow from (or shrink back to) the side panel
+    const { screen, body } = this.$;
+    const before = screen.getBoundingClientRect();
+    body.classList.toggle("present", on);
+    this.toggleAttribute("presenting", on);
+    const after = screen.getBoundingClientRect();
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches || !before.width || !after.width) return;
+    const t = `translate(${before.left - after.left}px, ${before.top - after.top}px) ` +
+      `scale(${before.width / after.width}, ${before.height / after.height})`;
+    screen.animate([{ transformOrigin: "0 0", transform: t }, { transformOrigin: "0 0", transform: "none" }],
+      { duration: on ? 420 : 360, easing: "cubic-bezier(.2, .7, .2, 1)" });
+  }
+
+  // Raise hand: open a small input over the presentation and send it as a message.
+  #bindHand() {
+    const { hand, ask, askBox, askHint } = this.$;
+    hand.addEventListener("click", () => {
+      if (ask.hidden) this.#raiseHand();
+      else this.#lowerHand();
+    });
+    this.$.end.addEventListener("click", async () => {
+      this.$.end.disabled = true;
+      const res = await this.stopPresent();
+      this.$.end.disabled = false;
+      if (!res.ok) { this.#openAsk(true); askHint.textContent = `발표 종료 실패: ${res.error}`; }
+    });
+    ask.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = askBox.value.trim();
+      if (!text) return;
+      askHint.textContent = "보내는 중…";
+      const res = await this.send(text, "message");
+      if (!res.ok) { askHint.textContent = `전송 실패: ${res.error}`; return; }
+      askBox.value = "";
+      this.#handUp = false; // the question itself ends the raised hand
+      this.#openAsk(false);
+      hand.classList.add("sent");
+      setTimeout(() => hand.classList.remove("sent"), 1500);
+    });
+    askBox.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask.requestSubmit(); }
+      if (e.key === "Escape") { e.preventDefault(); this.#lowerHand(); hand.focus(); }
+    });
+  }
+
+  // Raise: open the input and tell the agent to pause. Lower (closed without
+  // asking): tell it to go on. Failures only show a hint; asking still works.
+  #handUp = false;
+  async #raiseHand() {
+    this.#openAsk(true);
+    if (this.#handUp) return;
+    this.#handUp = true;
+    const res = await this.send("사용자가 손을 듦: 질문 입력 중", "hand-raise");
+    if (!res.ok && !this.$.ask.hidden) this.$.askHint.textContent = `손들기 알림 실패: ${res.error}`;
+  }
+  async #lowerHand() {
+    this.#openAsk(false);
+    if (!this.#handUp) return;
+    this.#handUp = false;
+    await this.send("사용자가 질문 없이 손을 내림", "hand-lower");
+  }
+
+  #openAsk(open) {
+    const { hand, ask, askBox, askHint } = this.$;
+    ask.hidden = !open;
+    hand.setAttribute("aria-expanded", String(open));
+    askHint.textContent = "";
+    if (open) askBox.focus();
+  }
+
+  // Agent reply as a short-lived bubble over the presented screen.
+  // kind "user": the viewer's own question (plain text, accent colour).
+  #caption(text, kind = "agent") {
+    if (!text?.trim()) return;
+    const el = document.createElement("div");
+    el.className = `caption ${kind}`;
+    el.part = "caption";
+    if (kind === "user") { el.textContent = text; el.classList.add("plain"); }
+    else if (this.#md) el.innerHTML = this.#md(text);
+    else { el.textContent = text; el.classList.add("plain"); }
+    const box = this.$.captions;
+    box.append(el);
+    const leave = () => {
+      if (el.classList.contains("out")) return;
+      el.classList.add("out");
+      setTimeout(() => el.remove(), 500);
+    };
+    setTimeout(leave, AgentBridge.CAPTION_MS);
+    const live = [...box.children].filter((c) => !c.classList.contains("out"));
+    live.slice(0, Math.max(0, live.length - AgentBridge.CAPTION_MAX)).forEach((c) => c.__leave?.());
+    el.__leave = leave;
   }
 
   // ---------- composer resize grip (top edge) ----------
@@ -456,7 +667,7 @@ class AgentBridge extends HTMLElement {
     const mods = (e) => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
     const BUTTONS = ["left", "middle", "right"];
 
-    controlBtn.addEventListener("click", () => this.#setControl(!this.#controlWs));
+    controlBtn.addEventListener("click", () => { if (!this.#present.on) this.#setControl(!this.#controlWs); });
 
     img.addEventListener("mousedown", (e) => {
       if (!on()) return;

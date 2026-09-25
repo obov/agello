@@ -7,11 +7,15 @@
 // POST /send             {action, text} -> herdr agent prompt
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
 // WS   /input            user control: CDP Input.* commands forwarded to the page
+// GET  /present          presentation state
+// POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
+//                        ({stop: true, from: "viewer"}: ended from the page, the agent is told
+//                         with "[browser] action=present-stop")
 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
-import { createScreencast } from "./screencast.ts";
+import { createScreencast, type Rect } from "./screencast.ts";
 
 export type ServerOptions = {
   port: number;
@@ -76,6 +80,17 @@ export function isNarration(b: any): boolean {
 async function herdr(timeout: number, ...cmd: string[]): Promise<any> {
   return (await runJson(["herdr", ...cmd], timeout)) ?? { error: { code: "herdr_failed" } };
 }
+
+// Presentation rect from the API: finite, non-negative origin, positive size (CSS px).
+export function parseRect(r: any): Rect | null {
+  if (!r || typeof r !== "object") return null;
+  const v = [r.x, r.y, r.w, r.h].map(Number);
+  if (!v.every(Number.isFinite) || v[0] < 0 || v[1] < 0 || v[2] < 1 || v[3] < 1) return null;
+  const [x, y, w, h] = v.map(Math.round);
+  return { x, y, w, h };
+}
+
+export type Present = { on: boolean; rect?: Rect; since?: string };
 
 type Status =
   | { alive: false; reason: string; pane: string }
@@ -291,6 +306,40 @@ export async function startServer(opts: ServerOptions) {
     herdrTab: async () => (await agentInfo())?.tab_id,
   });
 
+  // ----- presentation mode -----
+  // on: viewers show only the screen, full size, with agent replies as
+  // short-lived bubbles. rect: crop of the visible viewport (unset = whole screen).
+
+  let present: Present = { on: false };
+  function setPresent(next: Present) {
+    present = next;
+    screen.setClip(next.on ? (next.rect ?? null) : null);
+    broadcast("present", present);
+  }
+
+  async function presentRequest(req: Request): Promise<Response> {
+    const data = (await req.json().catch(() => ({}))) as { rect?: unknown; stop?: boolean; from?: string };
+    if (data.stop) {
+      const was = present.on;
+      setPresent({ on: false });
+      // Ended from the page: the agent may still be presenting, so tell it.
+      // (The CLI stop comes from the agent itself and needs no notice.)
+      let notified: string | undefined;
+      if (was && data.from === "viewer") {
+        const r = await promptAgent("present-stop", "사용자가 페이지에서 발표를 종료함");
+        notified = r.ok ? "ok" : r.error;
+      }
+      return Response.json({ ok: true, present, notified });
+    }
+    let rect: Rect | undefined;
+    if (data.rect != null) {
+      rect = parseRect(data.rect) ?? undefined;
+      if (!rect) return Response.json({ ok: false, error: "invalid_rect" }, { status: 400 });
+    }
+    setPresent({ on: true, rect, since: present.on ? present.since : new Date().toISOString() });
+    return Response.json({ ok: true, present });
+  }
+
   // ----- HTTP -----
 
   // Same-origin and localhost pages are allowed by default; add more with
@@ -329,6 +378,7 @@ export async function startServer(opts: ServerOptions) {
           tools: [...pendingTools.keys()],
         });
         if (lastStatus) send(c, "status", lastStatus);
+        send(c, "present", present);
         for (const t of pendingTools.values()) send(c, "tool_start", t);
         ping = setInterval(() => send(c, "ping", {}), 15000);
       },
@@ -342,22 +392,32 @@ export async function startServer(opts: ServerOptions) {
     });
   }
 
+  // Type a [browser] prompt into the agent session.
+  async function promptAgent(action: string, text: string): Promise<{ ok: boolean; error?: string; status?: number }> {
+    const st = await checkStatus();
+    if (!st.alive) return { ok: false, error: st.reason, status: 409 };
+    if (st.status === "blocked") return { ok: false, error: "agent_blocked", status: 409 };
+    const res = await herdr(10000, "agent", "prompt", PANE, formatPrompt(action, text.trim()));
+    if (res?.error) return { ok: false, error: res.error.code, status: 502 };
+    return { ok: true };
+  }
+
   async function sendPrompt(req: Request): Promise<Response> {
     const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string };
-    const st = await checkStatus();
-    if (!st.alive) return Response.json({ ok: false, error: st.reason }, { status: 409 });
-    if (st.status === "blocked") return Response.json({ ok: false, error: "agent_blocked" }, { status: 409 });
-
     const action = /^[\w-]{1,32}$/.test(data.action ?? "") ? data.action! : "message";
-    const res = await herdr(10000, "agent", "prompt", PANE, formatPrompt(action, (data.text ?? "").trim()));
-    if (res?.error) return Response.json({ ok: false, error: res.error.code }, { status: 502 });
-    return Response.json({ ok: true });
+    const r = await promptAgent(action, data.text ?? "");
+    return r.ok ? Response.json({ ok: true }) : Response.json({ ok: false, error: r.error }, { status: r.status });
   }
 
   async function route(req: Request, url: URL): Promise<Response> {
     switch (url.pathname) {
       case "/status":
-        return Response.json({ ...(await checkStatus()), browser: opts.browser, screen: await screen.describe() });
+        return Response.json({
+          ...(await checkStatus()),
+          browser: opts.browser,
+          screen: await screen.describe(),
+          present,
+        });
       case "/events":
         return events();
       case "/screen":
@@ -368,6 +428,9 @@ export async function startServer(opts: ServerOptions) {
         });
       case "/send":
         if (req.method === "POST") return sendPrompt(req);
+        break;
+      case "/present":
+        return req.method === "POST" ? presentRequest(req) : Response.json(present);
     }
     return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
   }

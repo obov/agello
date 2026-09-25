@@ -22,6 +22,11 @@ Usage:
   ${NAME} stop [--port N|--pane ID|--all]  Stop a server (default: this pane's)
   ${NAME} status [--json]      List running servers
   ${NAME} open [--port N|--pane ID]        Open the page (default: this pane's server)
+  ${NAME} present [x,y,w,h] [--port N|--pane ID]  Presentation mode: the page shows only the screen,
+                         full size, cropped to the rect (CSS px of the visible viewport; omit for the
+                         whole screen), with agent replies as bubbles that fade after 10s.
+                         Run again to move the crop.
+  ${NAME} present stop [--port N|--pane ID]       End presentation mode (bubbles stay in the chat)
   ${NAME} help | --version
 
 start options:
@@ -279,6 +284,40 @@ async function cmdOpen(argv: string[]) {
   console.log(inst.url);
 }
 
+async function cmdPresent(argv: string[]) {
+  const { values: o, positionals } = parseArgs({
+    args: argv,
+    options: { port: { type: "string" }, pane: { type: "string" } },
+    allowPositionals: true,
+  });
+  const inst = await resolveTarget(o);
+  const arg = positionals.join(",");
+  let body: object;
+  if (arg === "stop") body = { stop: true };
+  else if (!arg) body = {};
+  else {
+    const v = arg.split(/[\s,]+/).filter(Boolean).map(Number);
+    if (v.length !== 4 || !v.every(Number.isFinite)) fail(`rect must be x,y,w,h (got "${arg}")`);
+    body = { rect: { x: v[0], y: v[1], w: v[2], h: v[3] } };
+  }
+  let res: any;
+  try {
+    const r = await fetch(`${inst.url}/present`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(4000),
+    });
+    res = await r.json();
+  } catch {
+    fail(`server unreachable: ${inst.url}`);
+  }
+  if (!res?.ok) fail(res?.error ?? "failed");
+  const p = res.present;
+  if (!p.on) console.log("presentation: off");
+  else console.log(`presentation: on ${p.rect ? `rect=${p.rect.x},${p.rect.y},${p.rect.w},${p.rect.h}` : "(whole screen)"}`);
+}
+
 // ---------- main ----------
 
 const [cmd, ...rest] = Bun.argv.slice(2);
@@ -294,6 +333,9 @@ switch (cmd) {
     break;
   case "open":
     await cmdOpen(rest);
+    break;
+  case "present":
+    await cmdPresent(rest);
     break;
   case "--version":
   case "-v":
