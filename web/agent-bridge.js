@@ -6,7 +6,7 @@
 //
 // Attributes
 //   server       bridge server origin (default: origin this script was loaded from)
-//   heading      header text (default: "Agent Bridge")
+//   heading      header text (default: "agello")
 //   no-header    hide header
 //   no-actions   hide approve/reject buttons
 //   no-history   do not persist chat in localStorage (default: persisted per server + pane)
@@ -298,7 +298,7 @@ class AgentBridge extends HTMLElement {
   }
 
   connectedCallback() {
-    this.$.heading.textContent = this.getAttribute("heading") || "Agent Bridge";
+    this.$.heading.textContent = this.getAttribute("heading") || "agello";
     this.#connect();
     this.#syncScreen();
   }
@@ -310,7 +310,7 @@ class AgentBridge extends HTMLElement {
     this.#setControl(false);
   }
   attributeChangedCallback(name) {
-    if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "Agent Bridge";
+    if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "agello";
     if (name === "server" && this.isConnected) { this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
     if (name === "screen" && this.isConnected) this.#syncScreen();
   }
