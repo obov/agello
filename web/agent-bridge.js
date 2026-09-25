@@ -154,7 +154,6 @@ header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; bord
          background: var(--_panel); }
 :host([no-header]) header { display: none; }
 h1 { font-size: 14px; margin: 0; font-weight: 600; }
-.clear-btn { font-size: 11px; padding: 2px 9px; border-radius: 999px; }
 .session { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--_muted); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--_muted); }
 .dot.idle, .dot.done { background: var(--_ok); } .dot.working { background: var(--_busy); }
@@ -363,7 +362,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 `;
 
 const TEMPLATE = `
-<header><h1 part="heading"></h1><div class="session"><button class="term-btn" aria-pressed="false" title="터미널에서 실행 중인 세션 보기 (다시 누르면 채팅)" aria-label="터미널"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button><button class="clear-btn" title="이 pane의 저장된 대화 삭제">기록 지우기</button><button class="pane-btn" aria-haspopup="dialog" aria-expanded="false" title="pane 선택"><span class="dot"></span><span class="state">연결 중</span><span aria-hidden="true">▾</span></button></div></header>
+<header><h1 part="heading"></h1><div class="session"><button class="term-btn" aria-pressed="false" title="터미널에서 실행 중인 세션 보기 (다시 누르면 채팅)" aria-label="터미널"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button><button class="pane-btn" aria-haspopup="dialog" aria-expanded="false" title="pane 선택"><span class="dot"></span><span class="state">연결 중</span><span aria-hidden="true">▾</span></button></div></header>
 <div class="drawer-backdrop"></div>
 <aside class="drawer" role="dialog" aria-label="pane 선택">
   <div class="drawer-head"><strong>pane 선택</strong><button class="icon-btn ws-add" title="workspace 추가" aria-label="workspace 추가">+</button><button class="icon-btn panes-refresh" title="새로고침" aria-label="새로고침">↻</button><button class="icon-btn drawer-close" title="닫기 (Esc)" aria-label="닫기">×</button></div>
@@ -443,7 +442,7 @@ class AgentBridge extends HTMLElement {
       activity: q(".activity"), box: q("textarea"), hint: q(".hint"),
       buttons: this.#root.querySelectorAll("button[data-action]"),
       live: q(".live"), url: q(".screen-bar .url"), viewport: q(".viewport"), img: q(".viewport img"),
-      controlBtn: q(".control-btn"), kbd: q(".kbd"), clearBtn: q(".clear-btn"),
+      controlBtn: q(".control-btn"), kbd: q(".kbd"),
       body: q(".body"), screen: q(".screen"), captions: q(".captions"),
       hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
     };
@@ -460,7 +459,6 @@ class AgentBridge extends HTMLElement {
     this.#bindHand();
     q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
-    this.$.clearBtn.addEventListener("click", () => this.clearHistory());
     this.#bindPanes();
   }
 
