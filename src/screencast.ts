@@ -275,5 +275,68 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     return !!r && !r.exceptionDetails;
   }
 
-  return { handle, input, describe, setClip, evaluate };
+  // Annotation: which element is at a point (hover / click) or where a
+  // selected element is now (by selector). Coordinates are CSS px of the
+  // visible viewport, same as the full screencast frame. Not while cropped.
+  async function inspect(q: InspectQuery): Promise<Inspected | null> {
+    if (clip) return null;
+    const r = await request("Runtime.evaluate", {
+      expression: `(${INSPECT_JS})(${JSON.stringify(q)})`,
+      returnByValue: true,
+    });
+    return r && !r.exceptionDetails ? (r.result?.value ?? null) : null;
+  }
+
+  return { handle, input, describe, setClip, evaluate, inspect };
 }
+
+export type InspectQuery = { x?: number; y?: number; selector?: string; full?: boolean };
+export type Inspected = {
+  selector: string;
+  label: string; // tag#id.class, for the hover tooltip
+  rect: { x: number; y: number; w: number; h: number };
+  text?: string; // full only
+  url?: string; // full only
+};
+
+// Runs in the page. Selector: nearest unique id / data-testid ancestor, then
+// tag:nth-of-type steps down to the element (light DOM only).
+const INSPECT_JS = String((q: InspectQuery) => {
+  let el: Element | null = null;
+  if (q.selector) {
+    try {
+      el = document.querySelector(q.selector);
+    } catch {}
+  } else el = document.elementFromPoint(q.x ?? 0, q.y ?? 0);
+  if (!el || el === document.documentElement) return null;
+  const esc = CSS.escape;
+  const unique = (s: string) => document.querySelectorAll(s).length === 1;
+  const step = (e: Element): [string, boolean] => {
+    if (e.id && unique(`#${esc(e.id)}`)) return [`#${esc(e.id)}`, true];
+    for (const a of ["data-testid", "data-test", "data-cy"]) {
+      const v = e.getAttribute(a);
+      if (v && unique(`[${a}="${esc(v)}"]`)) return [`[${a}="${esc(v)}"]`, true];
+    }
+    const same = e.parentElement ? [...e.parentElement.children].filter((c) => c.localName === e.localName) : [];
+    return [same.length > 1 ? `${e.localName}:nth-of-type(${same.indexOf(e) + 1})` : e.localName, false];
+  };
+  const parts: string[] = [];
+  for (let e: Element | null = el; e && e !== document.documentElement; e = e.parentElement) {
+    const [s, anchor] = step(e);
+    parts.unshift(s);
+    if (anchor || e === document.body) break;
+  }
+  const cls = [...el.classList].slice(0, 2).map((c) => `.${c}`).join("");
+  const r = el.getBoundingClientRect();
+  const out: any = {
+    selector: parts.join(" > "),
+    label: `${el.localName}${el.id ? `#${el.id}` : ""}${cls}`,
+    rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+  };
+  if (q.full) {
+    const t = (el as HTMLInputElement).value || el.getAttribute("aria-label") || el.getAttribute("alt") || el.textContent || "";
+    out.text = t.replace(/\s+/g, " ").trim().slice(0, 80);
+    out.url = location.href;
+  }
+  return out;
+});

@@ -6,6 +6,7 @@
 - Live session status, tool activity, and prompts queued while the agent is busy (same order as the terminal)
 - Conversation saved per pane in the browser, kept across reloads
 - Optional live view of a `terminal-browser` screen, with an on/off switch to control it yourself
+- Annotate: point at an element on that screen and send a request about it, with its CSS selector
 - Embeddable `<agent-bridge>` web component
 
 Currently supports **Claude Code** sessions.
@@ -58,6 +59,18 @@ Messages sent from the page arrive in the agent as:
 ```
 
 The approve / reject buttons send `action=approve` / `action=reject`.
+
+### Annotate
+
+The `주석` button on the screen panel turns on annotate mode: hovering tints the element under the pointer (with its tag and size), clicking outlines it and opens an input next to it. The wheel still scrolls the page, and the outline follows the element as the page changes. The request arrives as:
+
+```
+[browser] action=annotate make this red / and bolder
+대상: #app > main > button:nth-of-type(2)
+요소: button.primary "Save" · 위치 120,340 크기 96x32 · http://localhost:3000/
+```
+
+Selector: nearest unique `id` / `data-testid` ancestor, then `tag:nth-of-type` steps (light DOM only). Coordinates are CSS px of the viewport. Off while presenting and while "내 조작" is on.
 
 ### Commands
 

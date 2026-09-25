@@ -5,8 +5,10 @@
 // GET  /status           session liveness (herdr agent get + pane get)
 // GET  /events           SSE: status, chat messages, tool start/end (from transcript JSONL)
 // POST /send             {action, text} -> herdr agent prompt
+//                        (action "annotate": + target {selector, label, rect, text?, url?} from inspect)
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
-// WS   /input            user control: CDP Input.* commands forwarded to the page
+// WS   /input            user control: CDP Input.* commands forwarded to the page;
+//                        {id, inspect: {x, y} | {selector}, full?} -> {id, result}: element at a point (annotation)
 // GET  /present          presentation state
 // POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
 //                        ({stop: true, from: "viewer"}: ended from the page, the agent is told
@@ -19,7 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
 import { createPlayer, parsePos, parseScript, type PlayerInfo } from "./player.ts";
-import { createScreencast, type Rect } from "./screencast.ts";
+import { createScreencast, type Inspected, type Rect } from "./screencast.ts";
 
 export type ServerOptions = {
   port: number;
@@ -92,6 +94,21 @@ export function parseRect(r: any): Rect | null {
   if (!v.every(Number.isFinite) || v[0] < 0 || v[1] < 0 || v[2] < 1 || v[3] < 1) return null;
   const [x, y, w, h] = v.map(Math.round);
   return { x, y, w, h };
+}
+
+// Annotation prompt: the viewer's request plus the element it points at, in
+// 3 lines (request / selector / element summary).
+export function formatAnnotation(text: string, t: any): string | null {
+  if (!t || typeof t.selector !== "string" || !t.selector || t.selector.length > 1000) return null;
+  const clean = (v: unknown, n: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+  const request = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join(" / ");
+  const r = t.rect ?? {};
+  const [x, y, w, h] = [r.x, r.y, r.w, r.h].map((v) => Math.round(Number(v) || 0));
+  const label = clean(t.label, 120);
+  const snippet = clean(t.text, 80);
+  const url = clean(t.url, 300);
+  const info = [`요소: ${label}${snippet ? ` "${snippet}"` : ""}`, `위치 ${x},${y} 크기 ${w}x${h}`, url].filter(Boolean);
+  return [request, `대상: ${clean(t.selector, 1000)}`, info.join(" · ")].join("\n");
 }
 
 export type Present = { on: boolean; rect?: Rect; since?: string; player?: PlayerInfo };
@@ -465,9 +482,14 @@ export async function startServer(opts: ServerOptions) {
   }
 
   async function sendPrompt(req: Request): Promise<Response> {
-    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string };
+    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string; target?: Inspected };
     const action = /^[\w-]{1,32}$/.test(data.action ?? "") ? data.action! : "message";
     let text = data.text ?? "";
+    if (action === "annotate") {
+      const t = formatAnnotation(text, data.target);
+      if (!t || !text.trim()) return Response.json({ ok: false, error: "invalid_target" }, { status: 400 });
+      text = t;
+    }
     // Raised hand: stop the script at once (no agent round trip) and tell the
     // agent where it stopped.
     if (action === "hand-raise") {
@@ -515,8 +537,24 @@ export async function startServer(opts: ServerOptions) {
     port: opts.port,
     idleTimeout: 0, // keep SSE open
     websocket: {
-      message(_ws, msg) {
-        screen.input(String(msg));
+      async message(ws, msg) {
+        const raw = String(msg);
+        let m: any;
+        try {
+          m = JSON.parse(raw);
+        } catch {
+          return;
+        }
+        if (m?.inspect) {
+          const q = m.inspect;
+          const query =
+            typeof q.selector === "string"
+              ? { selector: q.selector.slice(0, 1000), full: !!q.full }
+              : { x: Number(q.x) || 0, y: Number(q.y) || 0, full: !!q.full };
+          ws.send(JSON.stringify({ id: m.id, result: await screen.inspect(query) }));
+          return;
+        }
+        screen.input(raw);
       },
     },
     async fetch(req, server) {
