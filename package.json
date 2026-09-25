@@ -13,5 +13,6 @@
   ],
   "engines": {
     "bun": ">=1.1"
-  }
+  },
+  "license": "MIT"
 }

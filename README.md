@@ -89,3 +89,7 @@ See `web/embed-example.html`.
 ## Security
 
 The server listens on `127.0.0.1` only. Data and input endpoints accept requests from the same origin and `localhost` pages only; other origins get `403` unless added with `--allow-origin`. Anything allowed to post to `/send` can type into your agent session, so keep the allow list short.
+
+## License
+
+MIT
