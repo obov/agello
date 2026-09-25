@@ -1,0 +1,17 @@
+{
+  "name": "agello",
+  "version": "0.1.0",
+  "description": "Talk to a coding agent in a herdr pane from the browser: chat, live status, and a shared browser screen.",
+  "type": "module",
+  "bin": {
+    "agello": "bin/agello.ts"
+  },
+  "files": [
+    "bin",
+    "src",
+    "web"
+  ],
+  "engines": {
+    "bun": ">=1.1"
+  }
+}

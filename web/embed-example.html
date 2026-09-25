@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Agent Bridge 임베드 예시</title>
+<script type="module" src="http://127.0.0.1:8765/agent-bridge.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; display: grid; grid-template-columns: 1fr 420px;
+         height: 100vh; }
+  main { padding: 32px; overflow: auto; }
+  aside { padding: 16px; border-left: 1px solid #ddd; }
+  agent-bridge { height: 100%; --ab-accent: #7048e8; }
+  #events { font: 12px ui-monospace, monospace; white-space: pre-wrap; color: #555; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>호스트 페이지</h1>
+    <p>오른쪽 패널이 <code>&lt;agent-bridge&gt;</code> 컴포넌트예요.</p>
+    <button id="ask">호스트 페이지에서 "현재 상태 요약해줘" 전송</button>
+    <h2>수신 이벤트</h2>
+    <div id="events"></div>
+  </main>
+  <aside>
+    <agent-bridge heading="Agent" no-actions></agent-bridge>
+  </aside>
+<script>
+  const bridge = document.querySelector('agent-bridge');
+  const events = document.getElementById('events');
+  const log = (type, d) => events.prepend(`${type} ${JSON.stringify(d).slice(0, 160)}\n`);
+  for (const t of ['agent-status', 'agent-message', 'agent-tool'])
+    bridge.addEventListener(t, e => log(t, e.detail));
+  document.getElementById('ask').onclick = () => bridge.send('현재 상태 요약해줘');
+</script>
+</body>
+</html>
