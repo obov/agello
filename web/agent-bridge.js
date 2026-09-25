@@ -36,6 +36,9 @@
 //   closing it without asking sends action=hand-lower so it can go on.
 //   The viewer's questions show as bubbles too, with the same 10s lifetime.
 //   An end button above it stops the presentation for every viewer.
+//   Script lines (`agello script` + `present resume`) arrive as agent messages
+//   with `script: "step.line"`. While the script is not playing and the agent
+//   is working (e.g. answering a question), a small loader is shown.
 //
 // Methods
 //   el.send(text, action = 'message') -> Promise<{ok, error?}>
@@ -199,6 +202,14 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .caption a { color: inherit; }
 @keyframes capIn { from { opacity: 0; translate: 0 10px; } }
 
+/* agent busy while presenting (answering, fixing the script): minimal loader */
+.busy { display: none; }
+.body.present .busy.on { position: absolute; left: 22px; bottom: 28px; z-index: 5; display: flex; align-items: center;
+  gap: 9px; padding: 9px 14px; border-radius: 999px; font-size: 13px; color: #fff; background: rgba(20, 20, 22, .72);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  animation: capIn .25s ease; }
+.busy .spinner { border-color: rgba(255,255,255,.25); border-top-color: #fff; }
+
 /* raise hand: ask the agent mid-presentation */
 .hand-wrap { display: none; }
 .body.present .hand-wrap { position: absolute; right: 22px; bottom: 28px; z-index: 5; display: flex;
@@ -328,6 +339,7 @@ const TEMPLATE = `
     <button class="control-btn" role="switch" aria-checked="false" title="켜면 마우스와 키보드 입력이 브라우저로 전달돼요 (끄기: Shift+Esc)">
       <span>내 조작</span><span class="track"><span class="knob"></span></span><span class="state-label">OFF</span></button></div>
   <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div><div class="captions" part="captions" aria-live="polite"></div>
+    <div class="busy" part="busy" role="status"><span class="spinner"></span><span>답변 준비 중</span></div>
     <div class="hand-wrap">
       <form class="ask" part="ask" hidden><textarea aria-label="에이전트에게 질문" placeholder="에이전트에게 질문 (Enter 전송, Esc 닫기)"></textarea>
         <div class="ask-row"><span class="ask-hint"></span><button type="submit" class="primary">보내기</button></div></form>
@@ -370,7 +382,7 @@ class AgentBridge extends HTMLElement {
       live: q(".live"), url: q(".screen-bar .url"), viewport: q(".viewport"), img: q(".viewport img"),
       controlBtn: q(".control-btn"), kbd: q(".kbd"), clearBtn: q(".clear-btn"),
       body: q(".body"), screen: q(".screen"), captions: q(".captions"),
-      hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
+      busy: q(".busy"), hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
     };
     this.$.buttons.forEach((b) => b.addEventListener("click", () => this.#submit(b.dataset.action)));
     this.#bindGrip();
@@ -452,7 +464,8 @@ class AgentBridge extends HTMLElement {
     on("message", (m) => {
       this.#addMessage(m);
       this.#saveMessage(m);
-      if (this.#present.on && m.role === "assistant") this.#caption(m.text);
+      // script lines carry their own on-screen time (>= 10s), others use CAPTION_MS
+      if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined);
       if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
       this.#emit("agent-message", m);
     });
@@ -498,6 +511,7 @@ class AgentBridge extends HTMLElement {
     const was = this.#present.on;
     this.#present = p ?? { on: false };
     this.#emit("agent-present", this.#present);
+    this.#renderBusy();
     if (on === was) return;
     if (on) this.#setControl(false);
     else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#handUp = false; }
@@ -513,6 +527,12 @@ class AgentBridge extends HTMLElement {
       `scale(${before.width / after.width}, ${before.height / after.height})`;
     screen.animate([{ transformOrigin: "0 0", transform: t }, { transformOrigin: "0 0", transform: "none" }],
       { duration: on ? 420 : 360, easing: "cubic-bezier(.2, .7, .2, 1)" });
+  }
+
+  #renderBusy() {
+    const s = this.#status;
+    const busy = this.#present.on && s?.alive && s.status === "working" && this.#present.player?.state !== "playing";
+    this.$.busy.classList.toggle("on", !!busy);
   }
 
   // Raise hand: open a small input over the presentation and send it as a message.
@@ -574,7 +594,7 @@ class AgentBridge extends HTMLElement {
 
   // Agent reply as a short-lived bubble over the presented screen.
   // kind "user": the viewer's own question (plain text, accent colour).
-  #caption(text, kind = "agent") {
+  #caption(text, kind = "agent", ms = AgentBridge.CAPTION_MS) {
     if (!text?.trim()) return;
     const el = document.createElement("div");
     el.className = `caption ${kind}`;
@@ -589,7 +609,7 @@ class AgentBridge extends HTMLElement {
       el.classList.add("out");
       setTimeout(() => el.remove(), 500);
     };
-    setTimeout(leave, AgentBridge.CAPTION_MS);
+    setTimeout(leave, ms);
     const live = [...box.children].filter((c) => !c.classList.contains("out"));
     live.slice(0, Math.max(0, live.length - AgentBridge.CAPTION_MAX)).forEach((c) => c.__leave?.());
     el.__leave = leave;
@@ -884,7 +904,7 @@ class AgentBridge extends HTMLElement {
       return;
     } else if (m.role === "assistant") {
       wrap.className = "msg assistant";
-      meta.textContent = `에이전트 · ${time}`;
+      meta.textContent = `에이전트${m.script ? ` · 대본 ${m.script}` : ""} · ${time}`;
       if (this.#md) bubble.innerHTML = this.#md(m.text);
       else { bubble.textContent = m.text; bubble.classList.add("plain"); }
     } else if (m.role === "browser") {
@@ -946,6 +966,7 @@ class AgentBridge extends HTMLElement {
     this.$.buttons.forEach((b) => (b.disabled = !canSend));
     if (!s || !s.alive || s.status === "idle") this.#tools.clear();
     this.#renderActivity();
+    this.#renderBusy();
     this.#emit("agent-status", s);
   }
 

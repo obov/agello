@@ -11,10 +11,14 @@
 // POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
 //                        ({stop: true, from: "viewer"}: ended from the page, the agent is told
 //                         with "[browser] action=present-stop")
+// GET  /script           presentation script + player position
+// POST /script           {script: {rect?, steps: [{go?, say: string[], hold?}]}} load (keeps position)
+// POST /player           {cmd: "resume" | "pause" | "goto", at?: "3" | "3.2"}
 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
+import { createPlayer, parsePos, parseScript, type PlayerInfo } from "./player.ts";
 import { createScreencast, type Rect } from "./screencast.ts";
 
 export type ServerOptions = {
@@ -90,7 +94,7 @@ export function parseRect(r: any): Rect | null {
   return { x, y, w, h };
 }
 
-export type Present = { on: boolean; rect?: Rect; since?: string };
+export type Present = { on: boolean; rect?: Rect; since?: string; player?: PlayerInfo };
 
 type Status =
   | { alive: false; reason: string; pane: string }
@@ -311,10 +315,67 @@ export async function startServer(opts: ServerOptions) {
   // short-lived bubbles. rect: crop of the visible viewport (unset = whole screen).
 
   let present: Present = { on: false };
+  const presentView = (): Present => ({ ...present, player: player.info() });
   function setPresent(next: Present) {
     present = next;
     screen.setClip(next.on ? (next.rect ?? null) : null);
-    broadcast("present", present);
+    if (!next.on) player.stop();
+    broadcast("present", presentView());
+  }
+
+  // Script player: agello owns order and timing, the agent owns the deck
+  // (each step's `go`) and decides when to resume after a question.
+  const player = createPlayer({
+    async go(expr) {
+      const js = expr.startsWith("#") ? `location.hash = ${JSON.stringify(expr)}` : expr;
+      if (!(await screen.evaluate(js))) console.error(`present: go failed: ${expr}`);
+    },
+    say(text, at, hold) {
+      broadcast("message", { role: "assistant", text, ts: new Date().toISOString(), script: at, hold });
+    },
+    done() {
+      const n = player.info().steps;
+      promptAgent("present-done", `대본 끝까지 재생함 (${n}장)`);
+    },
+    changed() {
+      broadcast("present", presentView());
+    },
+  });
+
+  // "마지막 표시 3.2 · 다음 3.3" for agent notices
+  const where = () => {
+    const i = player.info();
+    if (i.state === "empty") return "";
+    return [i.last && `마지막 표시 ${i.last}`, i.next && `다음 ${i.next}`].filter(Boolean).join(" · ");
+  };
+
+  async function scriptRequest(req: Request): Promise<Response> {
+    if (req.method !== "POST") return Response.json({ script: player.script(), player: player.info() });
+    const data = (await req.json().catch(() => ({}))) as { script?: unknown };
+    const script = parseScript(data.script);
+    if (typeof script === "string") return Response.json({ ok: false, error: script }, { status: 400 });
+    if (script.rect && !parseRect(script.rect))
+      return Response.json({ ok: false, error: "invalid_rect" }, { status: 400 });
+    player.load(script);
+    return Response.json({ ok: true, player: player.info() });
+  }
+
+  async function playerRequest(req: Request): Promise<Response> {
+    const data = (await req.json().catch(() => ({}))) as { cmd?: string; at?: string };
+    let error: string | null = null;
+    if (data.cmd === "resume") {
+      if (!present.on) {
+        const rect = player.script()?.rect;
+        setPresent({ on: true, rect: rect ? parseRect(rect)! : undefined, since: new Date().toISOString() });
+      }
+      error = player.resume();
+    } else if (data.cmd === "pause") player.pause();
+    else if (data.cmd === "goto") {
+      const pos = parsePos(data.at ?? "");
+      error = pos ? await player.goto(pos) : "invalid_position";
+    } else error = "unknown_cmd";
+    if (error) return Response.json({ ok: false, error, player: player.info() }, { status: 400 });
+    return Response.json({ ok: true, player: player.info() });
   }
 
   async function presentRequest(req: Request): Promise<Response> {
@@ -326,10 +387,11 @@ export async function startServer(opts: ServerOptions) {
       // (The CLI stop comes from the agent itself and needs no notice.)
       let notified: string | undefined;
       if (was && data.from === "viewer") {
-        const r = await promptAgent("present-stop", "사용자가 페이지에서 발표를 종료함");
+        const at = where();
+        const r = await promptAgent("present-stop", `사용자가 페이지에서 발표를 종료함${at ? ` (대본 정지: ${at})` : ""}`);
         notified = r.ok ? "ok" : r.error;
       }
-      return Response.json({ ok: true, present, notified });
+      return Response.json({ ok: true, present: presentView(), notified });
     }
     let rect: Rect | undefined;
     if (data.rect != null) {
@@ -337,7 +399,7 @@ export async function startServer(opts: ServerOptions) {
       if (!rect) return Response.json({ ok: false, error: "invalid_rect" }, { status: 400 });
     }
     setPresent({ on: true, rect, since: present.on ? present.since : new Date().toISOString() });
-    return Response.json({ ok: true, present });
+    return Response.json({ ok: true, present: presentView() });
   }
 
   // ----- HTTP -----
@@ -378,7 +440,7 @@ export async function startServer(opts: ServerOptions) {
           tools: [...pendingTools.keys()],
         });
         if (lastStatus) send(c, "status", lastStatus);
-        send(c, "present", present);
+        send(c, "present", presentView());
         for (const t of pendingTools.values()) send(c, "tool_start", t);
         ping = setInterval(() => send(c, "ping", {}), 15000);
       },
@@ -405,7 +467,15 @@ export async function startServer(opts: ServerOptions) {
   async function sendPrompt(req: Request): Promise<Response> {
     const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string };
     const action = /^[\w-]{1,32}$/.test(data.action ?? "") ? data.action! : "message";
-    const r = await promptAgent(action, data.text ?? "");
+    let text = data.text ?? "";
+    // Raised hand: stop the script at once (no agent round trip) and tell the
+    // agent where it stopped.
+    if (action === "hand-raise") {
+      player.pause();
+      const at = where();
+      if (at) text += ` (대본 정지: ${at})`;
+    }
+    const r = await promptAgent(action, text);
     return r.ok ? Response.json({ ok: true }) : Response.json({ ok: false, error: r.error }, { status: r.status });
   }
 
@@ -416,7 +486,7 @@ export async function startServer(opts: ServerOptions) {
           ...(await checkStatus()),
           browser: opts.browser,
           screen: await screen.describe(),
-          present,
+          present: presentView(),
         });
       case "/events":
         return events();
@@ -430,7 +500,12 @@ export async function startServer(opts: ServerOptions) {
         if (req.method === "POST") return sendPrompt(req);
         break;
       case "/present":
-        return req.method === "POST" ? presentRequest(req) : Response.json(present);
+        return req.method === "POST" ? presentRequest(req) : Response.json(presentView());
+      case "/script":
+        return scriptRequest(req);
+      case "/player":
+        if (req.method === "POST") return playerRequest(req);
+        break;
     }
     return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
   }

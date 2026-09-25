@@ -268,5 +268,12 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     return browser ? { connected: false, browser: browser.key } : { connected: false, reason };
   }
 
-  return { handle, input, describe, setClip };
+  // Run JS in the relayed tab (presentation script `go`). Needs the relay to be
+  // connected, i.e. at least one viewer. Returns false if it could not run.
+  async function evaluate(expression: string): Promise<boolean> {
+    const r = await request("Runtime.evaluate", { expression, awaitPromise: true });
+    return !!r && !r.exceptionDetails;
+  }
+
+  return { handle, input, describe, setClip, evaluate };
 }

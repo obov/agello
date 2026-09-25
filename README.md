@@ -69,6 +69,8 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 | `agello open [--port N \| --pane ID]` | Open the page (default: this pane's server) |
 | `agello present [x,y,w,h] [--port N \| --pane ID]` | Presentation mode (see below) |
 | `agello present stop` | End presentation mode |
+| `agello script load <file> \| show` | Load / show a presentation script |
+| `agello present resume \| pause \| goto <n[.m]>` | Play the script from where it stopped / stop it / move to a step |
 
 `start` options: `--pane <id>`, `--port <n>` (default: first free from 8765), `--session <id>`, `--browser <terminal-browser key>`, `--allow-origin <origin>` (repeatable), `--open`, `--foreground`.
 
@@ -86,6 +88,23 @@ State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
 - raising the hand tells the agent at once (`action=hand-raise`) so it can pause; closing the input without asking sends `action=hand-lower`
 
 Run `present` again to move the crop. User control is off while presenting.
+
+#### Scripts
+
+Write the talk ahead so each line appears the moment its screen does:
+
+```json
+{ "rect": "28,157,688,477",
+  "steps": [
+    { "go": "#1", "say": ["First line", "Second line"] },
+    { "go": "#2", "say": ["..."], "hold": 6 } ] }
+```
+
+- step: `go` brings the screen there (`#n` sets `location.hash`, anything else is JS run in the page; agello knows nothing about the deck), `say` lines are one bubble each, `hold` seconds a line stays on screen (default from length, 10 to 20s; never below 10s). Pacing: screen change, 1s, line, fade out, 0.3s, next line; after a step's last line 0.7s before the next screen
+- `present resume` plays from where it stopped (starts presentation mode with the script's `rect`); it first re-runs the current step's `go`, so the agent may move the screen freely while answering
+- raising a hand pauses at once; the agent gets `action=hand-raise` with the position (`마지막 표시 2.1 · 다음 2.2`)
+- `script load` again after editing keeps the position; `present goto 2.2` then `present resume` replays from a fixed line
+- at the end the agent gets `action=present-done`; while the script is paused and the agent is working, the page shows a small loader
 
 ## Embed
 
