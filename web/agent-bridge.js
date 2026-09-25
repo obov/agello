@@ -24,6 +24,12 @@
 //                  (tool calls are also kept in the conversation as one-line rows, like the terminal)
 //   agent-screen   detail: { connected, browser?, url?, title?, agentControlled? }
 //   agent-present  detail: { on, rect?: {x,y,w,h}, since? }
+//   agent-pane     detail: { pane, server }  another pane was picked in the drawer (server attribute changed)
+//
+// Pane picker
+//   Clicking the status in the header opens a drawer with herdr's workspace -> tab -> pane tree.
+//   Picking a pane switches to that pane's own server (started on demand). Workspaces, tabs and
+//   panes can be added there; nothing is closed from the page (closing kills the pane's processes).
 //
 // Presentation mode (started by the agent: `agello present [x,y,w,h]`)
 //   The screen panel expands to fill the window and shows only the given
@@ -73,6 +79,45 @@ const ACTIONS = {
 };
 
 const CSS = `
+.pane-btn { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+            color: var(--_muted); max-width: 46cqi; }
+.pane-btn .state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-btn .dot { flex: none; }
+.drawer-backdrop { display: none; position: absolute; inset: 0; z-index: 20; background: rgb(0 0 0 / .25); }
+.drawer { position: absolute; top: 0; right: 0; bottom: 0; z-index: 21; width: min(360px, 92%); display: flex;
+          flex-direction: column; background: var(--_panel); border-left: 1px solid var(--_line);
+          box-shadow: -8px 0 24px rgb(0 0 0 / .18); transform: translateX(100%); visibility: hidden;
+          transition: transform .18s ease, visibility 0s .18s; }
+:host([panes-open]) .drawer { transform: none; visibility: visible; transition: transform .18s ease; }
+:host([panes-open]) .drawer-backdrop { display: block; }
+.drawer-head { display: flex; gap: 6px; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--_line); }
+.drawer-head strong { font-size: 13px; margin-right: auto; }
+.icon-btn { padding: 1px 8px; border-radius: 6px; font-size: 14px; line-height: 1.5; }
+.pane-filter { width: 100%; padding: 5px 9px; font: inherit; font-size: 12px; border: 1px solid var(--_line);
+               border-radius: 7px; background: var(--_bg); color: var(--_text); }
+.drawer-search { padding: 8px 12px; border-bottom: 1px solid var(--_line); }
+.add-form { display: grid; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--_line); font-size: 12px; }
+.add-form[hidden] { display: none; }
+.add-form .add-title { font-weight: 600; }
+.add-form input, .add-form select { padding: 4px 8px; font: inherit; border: 1px solid var(--_line); border-radius: 6px;
+                                    background: var(--_bg); color: var(--_text); }
+.add-form .add-row { display: flex; gap: 6px; justify-content: flex-end; }
+.tree { flex: 1; overflow: auto; padding: 6px 0; font-size: 13px; }
+.tree-row { display: flex; align-items: center; gap: 6px; padding: 4px 10px; cursor: pointer; min-width: 0; }
+.tree-row:hover { background: var(--_user); }
+.tree-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-row .meta { font-size: 11px; color: var(--_muted); flex: none; }
+.tree-row .caret { width: 12px; flex: none; color: var(--_muted); font-size: 10px; }
+.tree-row .row-add { visibility: hidden; padding: 0 6px; font-size: 12px; border-radius: 5px; flex: none; }
+.tree-row:hover .row-add, .tree-row:focus-within .row-add { visibility: visible; }
+.tree-row.ws .name { font-weight: 600; }
+.tree-row.tab { padding-left: 26px; color: var(--_muted); }
+.tree-row.pane { padding-left: 30px; }
+.tree-row.pane.nested { padding-left: 46px; }
+.tree-row.pane.current { background: color-mix(in srgb, var(--_accent) 16%, transparent); }
+.tree-row .badge { font-size: 10px; padding: 0 6px; border-radius: 999px; border: 1px solid var(--_line); color: var(--_muted); flex: none; }
+.tree-empty, .drawer-hint { padding: 8px 12px; font-size: 12px; color: var(--_muted); }
+.drawer-hint:empty { display: none; }
 .term-btn { display: inline-flex; align-items: center; justify-content: center; padding: 3px 7px; border-radius: 999px; }
 .term-btn svg { width: 14px; height: 14px; }
 .term-btn[aria-pressed="true"] { background: var(--_accent); border-color: var(--_accent); color: white; }
@@ -318,7 +363,18 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 `;
 
 const TEMPLATE = `
-<header><h1 part="heading"></h1><div class="session"><button class="term-btn" aria-pressed="false" title="터미널에서 실행 중인 세션 보기 (다시 누르면 채팅)" aria-label="터미널"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button><button class="clear-btn" title="이 pane의 저장된 대화 삭제">기록 지우기</button><span class="dot"></span><span class="state">연결 중</span></div></header>
+<header><h1 part="heading"></h1><div class="session"><button class="term-btn" aria-pressed="false" title="터미널에서 실행 중인 세션 보기 (다시 누르면 채팅)" aria-label="터미널"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6l2 2-2 2M8.5 10.5h3"/></svg></button><button class="clear-btn" title="이 pane의 저장된 대화 삭제">기록 지우기</button><button class="pane-btn" aria-haspopup="dialog" aria-expanded="false" title="pane 선택"><span class="dot"></span><span class="state">연결 중</span><span aria-hidden="true">▾</span></button></div></header>
+<div class="drawer-backdrop"></div>
+<aside class="drawer" role="dialog" aria-label="pane 선택">
+  <div class="drawer-head"><strong>pane 선택</strong><button class="icon-btn ws-add" title="workspace 추가" aria-label="workspace 추가">+</button><button class="icon-btn panes-refresh" title="새로고침" aria-label="새로고침">↻</button><button class="icon-btn drawer-close" title="닫기 (Esc)" aria-label="닫기">×</button></div>
+  <div class="drawer-search"><input class="pane-filter" type="search" placeholder="workspace, 제목, 폴더 검색" aria-label="pane 검색"></div>
+  <form class="add-form" hidden><span class="add-title"></span>
+    <input name="label" placeholder="이름 (선택)" maxlength="80">
+    <input name="cwd" placeholder="폴더 경로 (선택, 절대 경로)">
+    <select name="direction" aria-label="분할 방향"><option value="right">오른쪽으로 분할</option><option value="down">아래로 분할</option></select>
+    <div class="add-row"><button type="button" class="add-cancel">취소</button><button type="submit" class="primary">추가</button></div></form>
+  <div class="tree" role="tree"></div><div class="drawer-hint" role="status"></div>
+</aside>
 <div class="body"><section class="chat">
 <div class="terminal-panel" aria-label="터미널"><div class="terminal-bar"><span class="terminal-status" role="status"></span><button class="terminal-retry">다시 연결</button></div><div class="terminal-host"></div></div>
 <div class="stage">
@@ -363,6 +419,9 @@ class AgentBridge extends HTMLElement {
   #terminalCleanup = null;
   #terminalVersion = 0;
   #terminalStyles = null;
+  #panes = null; // {current, workspaces}
+  #expanded = new Set();
+  #adding = null; // {kind, workspace?, pane?}
   #frame = { w: 0, h: 0 };
   #moveQueued = null;
   #status = null;
@@ -402,6 +461,7 @@ class AgentBridge extends HTMLElement {
     q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
     this.$.clearBtn.addEventListener("click", () => this.clearHistory());
+    this.#bindPanes();
   }
 
   get server() {
@@ -423,7 +483,7 @@ class AgentBridge extends HTMLElement {
   }
   attributeChangedCallback(name) {
     if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "agello";
-    if (name === "server" && this.isConnected) { this.#showTerminal(false); this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
+    if (name === "server" && this.isConnected) { this.#showTerminal(false); this.#openPanes(false); this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
     if (name === "screen" && this.isConnected) this.#syncScreen();
   }
 
@@ -455,6 +515,183 @@ class AgentBridge extends HTMLElement {
       this.#terminalCleanup = mountTerminal(q(".terminal-host"), q(".terminal-status"), this.server);
     } catch {
       if (version === this.#terminalVersion) q(".terminal-status").textContent = "터미널을 불러오지 못했습니다. 다시 연결해 주세요.";
+    }
+  }
+
+  // ---------- pane picker (herdr workspace -> tab -> pane) ----------
+
+  #bindPanes() {
+    const q = (s) => this.#root.querySelector(s);
+    q(".pane-btn").addEventListener("click", () => this.#openPanes(!this.hasAttribute("panes-open")));
+    q(".drawer-close").addEventListener("click", () => this.#openPanes(false));
+    q(".drawer-backdrop").addEventListener("click", () => this.#openPanes(false));
+    q(".panes-refresh").addEventListener("click", () => this.#loadPanes());
+    q(".ws-add").addEventListener("click", () => this.#startAdd({ kind: "workspace" }));
+    q(".pane-filter").addEventListener("input", () => this.#renderPanes());
+    q(".add-cancel").addEventListener("click", () => this.#startAdd(null));
+    q(".add-form").addEventListener("submit", (e) => { e.preventDefault(); this.#submitAdd(); });
+    q(".drawer").addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); this.#adding ? this.#startAdd(null) : this.#openPanes(false); }
+    });
+    q(".tree").addEventListener("click", (e) => {
+      const add = e.target.closest(".row-add");
+      const row = e.target.closest(".tree-row");
+      if (!row) return;
+      const { kind, id, ws } = row.dataset;
+      if (add) return this.#startAdd(kind === "ws" ? { kind: "tab", workspace: id } : { kind: "pane", pane: id, workspace: ws });
+      if (kind === "pane") return this.#selectPane(id);
+      this.#expanded.has(id) ? this.#expanded.delete(id) : this.#expanded.add(id);
+      this.#renderPanes();
+    });
+    q(".tree").addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && e.target.classList.contains("tree-row")) { e.preventDefault(); e.target.click(); }
+    });
+  }
+
+  #openPanes(on) {
+    if (on === this.hasAttribute("panes-open")) return;
+    this.toggleAttribute("panes-open", on);
+    const q = (s) => this.#root.querySelector(s);
+    q(".pane-btn").setAttribute("aria-expanded", String(on));
+    if (!on) { this.#startAdd(null); q(".pane-btn").focus(); return; }
+    q(".pane-filter").value = "";
+    this.#loadPanes(true);
+    q(".pane-filter").focus();
+  }
+
+  async #loadPanes(expandCurrent = false) {
+    const hint = this.#root.querySelector(".drawer-hint");
+    hint.textContent = "불러오는 중…";
+    try {
+      const res = await fetch(`${this.server}/panes`);
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error);
+      this.#panes = d;
+      hint.textContent = "";
+      if (expandCurrent) {
+        const ws = d.workspaces.find((w) => w.tabs.some((t) => t.panes.some((p) => p.id === d.current)));
+        const tab = ws?.tabs.find((t) => t.panes.some((p) => p.id === d.current));
+        if (ws) this.#expanded.add(ws.id);
+        if (tab) this.#expanded.add(tab.id);
+      }
+    } catch {
+      hint.textContent = "pane 목록을 불러오지 못했습니다.";
+    }
+    this.#renderPanes();
+  }
+
+  #renderPanes() {
+    const tree = this.#root.querySelector(".tree");
+    const d = this.#panes;
+    if (!d) { tree.replaceChildren(); return; }
+    const filter = this.#root.querySelector(".pane-filter").value.trim().toLowerCase();
+    const hit = (...xs) => !filter || xs.some((x) => String(x ?? "").toLowerCase().includes(filter));
+    const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+    const row = (kind, id, cls, level, expanded) => {
+      const r = el("div", `tree-row ${cls}`);
+      Object.assign(r.dataset, { kind, id });
+      r.tabIndex = 0;
+      r.setAttribute("role", "treeitem");
+      r.setAttribute("aria-level", String(level));
+      if (expanded !== undefined) r.setAttribute("aria-expanded", String(expanded));
+      return r;
+    };
+    const addBtn = (label) => { const b = el("button", "row-add", "+"); b.type = "button"; b.title = label; b.setAttribute("aria-label", label); return b; };
+    const base = (p) => p.cwd?.split("/").filter(Boolean).pop();
+    const rows = [];
+    for (const ws of d.workspaces) {
+      const tabs = ws.tabs.map((t) => ({ ...t, panes: t.panes.filter((p) => hit(ws.label, t.label, p.id, p.agent, p.title, p.cwd)) }))
+        .filter((t) => t.panes.length);
+      if (filter && !tabs.length) continue;
+      const open = !!filter || this.#expanded.has(ws.id);
+      const r = row("ws", ws.id, "ws", 1, open);
+      const count = ws.tabs.reduce((n, t) => n + t.panes.length, 0);
+      r.append(el("span", "caret", open ? "▾" : "▸"), el("span", "name", ws.label || ws.id), el("span", "meta", String(count)), addBtn("tab 추가"));
+      rows.push(r);
+      if (!open) continue;
+      const single = ws.tabs.length === 1; // D5: a lone tab adds no information
+      for (const t of tabs) {
+        const tabOpen = single || !!filter || this.#expanded.has(t.id);
+        if (!single) {
+          const tr = row("tab", t.id, "tab", 2, tabOpen);
+          tr.append(el("span", "caret", tabOpen ? "▾" : "▸"), el("span", "name", `tab ${t.label}`), el("span", "meta", String(t.panes.length)));
+          rows.push(tr);
+        }
+        if (!tabOpen) continue;
+        for (const p of t.panes) {
+          const pr = row("pane", p.id, `pane${single ? "" : " nested"}${p.id === d.current ? " current" : ""}`, single ? 2 : 3);
+          pr.dataset.ws = ws.id;
+          if (p.id === d.current) pr.setAttribute("aria-current", "true");
+          const dot = el("span", `dot ${p.status}`);
+          dot.title = STATES[p.status] || p.status;
+          const name = el("span", "name", p.title || base(p) || p.id);
+          name.title = [p.title, p.cwd, p.id].filter(Boolean).join("\n");
+          const badge = el("span", "badge", p.agent || "셸");
+          if (p.agent !== "claude") badge.title = "채팅 미지원: 터미널로 연결";
+          pr.append(dot, name, badge, addBtn("pane 분할"));
+          rows.push(pr);
+        }
+      }
+    }
+    tree.replaceChildren(...rows);
+    if (!rows.length) tree.append(el("div", "tree-empty", filter ? "검색 결과 없음" : "pane 없음"));
+  }
+
+  #startAdd(target) {
+    this.#adding = target;
+    const form = this.#root.querySelector(".add-form");
+    form.hidden = !target;
+    if (!target) return;
+    form.reset();
+    const titles = { workspace: "새 workspace", tab: "새 tab", pane: "pane 분할" };
+    form.querySelector(".add-title").textContent = titles[target.kind];
+    form.elements.label.hidden = target.kind === "pane";
+    form.elements.direction.hidden = target.kind !== "pane";
+    (target.kind === "pane" ? form.elements.direction : form.elements.label).focus();
+  }
+
+  async #submitAdd() {
+    const target = this.#adding;
+    if (!target) return;
+    const f = this.#root.querySelector(".add-form").elements;
+    const hint = this.#root.querySelector(".drawer-hint");
+    const body = { ...target, cwd: f.cwd.value.trim() || undefined };
+    if (target.kind === "pane") body.direction = f.direction.value;
+    else body.label = f.label.value.trim() || undefined;
+    if (body.cwd && !body.cwd.startsWith("/")) { hint.textContent = "폴더 경로는 /로 시작하는 절대 경로여야 합니다."; return; }
+    hint.textContent = "만드는 중…";
+    try {
+      const res = await fetch(`${this.server}/panes/create`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error);
+      this.#startAdd(null);
+      if (target.workspace) this.#expanded.add(target.workspace);
+      await this.#selectPane(d.pane, { terminal: true }); // a new pane is a plain shell: show it as a terminal
+    } catch (e) {
+      hint.textContent = `추가 실패: ${e.message || "server_unreachable"}`;
+    }
+  }
+
+  async #selectPane(pane, { terminal = false } = {}) {
+    const hint = this.#root.querySelector(".drawer-hint");
+    if (pane === this.#panes?.current && !terminal) { this.#openPanes(false); return; }
+    hint.textContent = "연결 중…";
+    try {
+      const res = await fetch(`${this.server}/panes/connect`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pane }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error);
+      const info = this.#panes?.workspaces.flatMap((w) => w.tabs.flatMap((t) => t.panes)).find((p) => p.id === pane);
+      hint.textContent = "";
+      this.#openPanes(false);
+      if (d.url !== this.server) this.setAttribute("server", d.url);
+      this.#emit("agent-pane", { pane, server: d.url });
+      if (terminal || (info && info.agent !== "claude")) this.#showTerminal(true); // D8: chat is Claude-only
+    } catch (e) {
+      hint.textContent = `연결 실패: ${e.message || "server_unreachable"}`;
     }
   }
 

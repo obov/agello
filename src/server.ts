@@ -7,6 +7,9 @@
 // POST /send             {action, text} -> herdr agent prompt
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
 // WS   /terminal         interactive herdr terminal frames, keyboard input, resize
+// GET  /panes            herdr workspace -> tab -> pane tree
+// POST /panes/connect    {pane} -> url of that pane's server (started if needed)
+// POST /panes/create     {kind: workspace|tab|pane, cwd?, label?, workspace?, pane?, direction?}
 // WS   /input            user control: CDP Input.* commands forwarded to the page
 // GET  /present          presentation state
 // POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
@@ -14,6 +17,7 @@
 //                         with "[browser] action=present-stop")
 
 import { createTerminal, type SocketData } from "./terminal.ts";
+import { panesRoute } from "./panes.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
@@ -311,7 +315,8 @@ export async function startServer(opts: ServerOptions) {
 
   const screen = createScreencast({
     browserKey: opts.browser,
-    herdrTab: async () => (await agentInfo())?.tab_id,
+    // shell panes have no agent: fall back to the pane's own tab
+    herdrTab: async () => (await agentInfo())?.tab_id ?? (await herdr(3000, "pane", "get", PANE))?.result?.pane?.tab_id,
   });
 
   // ----- presentation mode -----
@@ -418,6 +423,10 @@ export async function startServer(opts: ServerOptions) {
   }
 
   async function route(req: Request, url: URL): Promise<Response> {
+    if (url.pathname.startsWith("/panes")) {
+      const res = await panesRoute(req, url.pathname, PANE);
+      if (res) return res;
+    }
     switch (url.pathname) {
       case "/status":
         return Response.json({

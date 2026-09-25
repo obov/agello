@@ -12,5 +12,17 @@
 </head>
 <body>
   <agent-bridge screen></agent-bridge>
+  <script>
+    // Keep the pane picked in the drawer across reloads (?server=http://127.0.0.1:<port>).
+    const bridge = document.querySelector("agent-bridge");
+    const saved = new URLSearchParams(location.search).get("server");
+    if (saved && /^http:\/\/127\.0\.0\.1:\d+$/.test(saved)) bridge.setAttribute("server", saved);
+    bridge.addEventListener("agent-pane", (e) => {
+      const url = new URL(location.href);
+      if (e.detail.server === location.origin) url.searchParams.delete("server");
+      else url.searchParams.set("server", e.detail.server);
+      history.replaceState(null, "", url);
+    });
+  </script>
 </body>
 </html>

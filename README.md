@@ -75,6 +75,12 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 
 State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
 
+### Pane picker
+
+Click the status in the header to open a drawer with herdr's workspace -> tab -> pane tree (the current pane's workspace is expanded; a workspace with a single tab lists its panes directly). Search filters by workspace, title, folder, or agent. Picking a pane switches the page to that pane's server, starting it if needed (`?server=` keeps the choice across reloads). Panes without Claude Code open as a terminal, since chat supports Claude Code only.
+
+`+` adds a workspace (top), a tab (workspace row), or splits a pane (pane row); new panes open as a terminal. Nothing can be closed from the page: closing a herdr pane ends its processes.
+
 ### Interactive terminal
 
 Click the terminal icon in the header to replace the chat with the pane's live terminal (the screen panel stays). Keyboard input (including Korean text, arrow keys, and Ctrl+C) goes directly to that terminal. The viewport follows the browser size, and the mouse wheel scrolls through Herdr. Click the icon again or close the page to release control; the pane and its process keep running. If disconnected, use **다시 연결** to restore the current screen.
@@ -119,6 +125,7 @@ See `web/embed-example.html`.
 - **Send**: `herdr agent prompt <pane> "<text>"` (kept to 3 lines so Claude Code does not treat it as a paste)
 - **Status**: `herdr agent get` / `herdr pane get`, polled every 1.5s
 - **Chat**: tails the Claude Code transcript (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`) and streams it over SSE
+- **Panes**: `GET /panes` (`herdr workspace/tab/pane list`), `POST /panes/connect` (`agello start --pane`), `POST /panes/create` (`herdr workspace create`, `tab create`, `pane split`, always `--no-focus`)
 - **Terminal**: `/terminal` WebSocket relays `herdr terminal session control <pane>` ANSI frames and validated input, resize, and scroll commands to xterm.js
 - **Screen**: finds the terminal-browser CDP port via `terminal-browser ls --json` and relays `Page.startScreencast` frames; user control forwards `Input.*` events only
 
@@ -128,7 +135,7 @@ The server listens on `127.0.0.1` only. Data and input endpoints accept requests
 
 ## Development
 
-Run `bun install` and `bun test`. Tests cover local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, and reconnect.
+Run `bun install` and `bun test`. Tests cover the pane tree and creation (against a mock herdr), local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, and reconnect.
 
 ## License
 
