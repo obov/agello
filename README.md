@@ -7,6 +7,7 @@
 - Conversation saved per pane in the browser, kept across reloads
 - Interactive terminal view of the existing herdr pane: live cursor, keyboard input, and automatic resize
 - Optional live view of a `terminal-browser` screen, with an on/off switch to control it yourself
+- Annotate: point at an element on that screen and send a request about it, with its CSS selector
 - Embeddable `<agent-bridge>` web component
 
 Chat currently supports **Claude Code** sessions. The terminal view connects directly to the pane, including ordinary shells and other terminal applications.
@@ -60,6 +61,18 @@ Messages sent from the page arrive in the agent as:
 
 The approve / reject buttons send `action=approve` / `action=reject`.
 
+### Annotate
+
+The `주석` button on the screen panel turns on annotate mode: hovering tints the element under the pointer (with its tag and size), clicking outlines it and opens an input next to it. The wheel still scrolls the page, and the outline follows the element as the page changes. The request arrives as:
+
+```
+[browser] action=annotate make this red / and bolder
+대상: #app > main > button:nth-of-type(2)
+요소: button.primary "Save" · 위치 120,340 크기 96x32 · http://localhost:3000/
+```
+
+Selector: nearest unique `id` / `data-testid` ancestor, then `tag:nth-of-type` steps (light DOM only). Coordinates are CSS px of the viewport. Off while presenting and while "내 조작" is on.
+
 ### Commands
 
 | Command | Description |
@@ -70,6 +83,8 @@ The approve / reject buttons send `action=approve` / `action=reject`.
 | `agello open [--port N \| --pane ID]` | Open the page (default: this pane's server) |
 | `agello present [x,y,w,h] [--port N \| --pane ID]` | Presentation mode (see below) |
 | `agello present stop` | End presentation mode |
+| `agello script load <file> \| show` | Load / show a presentation script |
+| `agello present resume \| pause \| goto <n[.m]>` | Play the script from where it stopped / stop it / move to a step |
 
 `start` options: `--pane <id>`, `--port <n>` (default: first free from 8765), `--session <id>`, `--browser <terminal-browser key>`, `--allow-origin <origin>` (repeatable), `--open`, `--foreground`.
 
@@ -101,6 +116,23 @@ The xterm.js renderer and its styles are served locally; no terminal CDN is requ
 - raising the hand tells the agent at once (`action=hand-raise`) so it can pause; closing the input without asking sends `action=hand-lower`
 
 Run `present` again to move the crop. User control is off while presenting.
+
+#### Scripts
+
+Write the talk ahead so each line appears the moment its screen does:
+
+```json
+{ "rect": "28,157,688,477",
+  "steps": [
+    { "go": "#1", "say": ["First line", "Second line"] },
+    { "go": "#2", "say": ["..."], "hold": 6 } ] }
+```
+
+- step: `go` brings the screen there (`#n` sets `location.hash`, anything else is JS run in the page; agello knows nothing about the deck), `say` lines are one bubble each, `hold` seconds a line stays on screen (default from length, 10 to 20s; never below 10s). Pacing: screen change, 1s, line, fade out, 0.3s, next line; after a step's last line 0.7s before the next screen
+- `present resume` plays from where it stopped (starts presentation mode with the script's `rect`); it first re-runs the current step's `go`, so the agent may move the screen freely while answering
+- raising a hand pauses at once; the agent gets `action=hand-raise` with the position (`마지막 표시 2.1 · 다음 2.2`)
+- `script load` again after editing keeps the position; `present goto 2.2` then `present resume` replays from a fixed line
+- at the end the agent gets `action=present-done`; while the script is paused and the agent is working, the page shows a small loader
 
 ## Embed
 

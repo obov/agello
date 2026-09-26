@@ -6,17 +6,22 @@
 // GET  /events           SSE: status, chat messages, tool start/end (from transcript JSONL)
 // POST /send             {action, text, images?: [{type, data(base64)}]} -> herdr agent prompt
 //                        (images are saved to $TMPDIR/agello-uploads and sent as [image: <path>])
+//                        (action "annotate": + target {selector, label, rect, text?, url?} from inspect)
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
 // POST /upload           {images: [{type, data(base64)}]} -> {paths}: terminal image paste
 // WS   /terminal         interactive herdr terminal frames, keyboard input, resize
 // GET  /panes            herdr workspace -> tab -> pane tree
 // POST /panes/connect    {pane} -> url of that pane's server (started if needed)
 // POST /panes/create     {kind: workspace|tab|pane, cwd?, label?, workspace?, pane?, direction?}
-// WS   /input            user control: CDP Input.* commands forwarded to the page
+// WS   /input            user control: CDP Input.* commands forwarded to the page;
+//                        {id, inspect: {x, y} | {selector}, full?} -> {id, result}: element at a point (annotation)
 // GET  /present          presentation state
 // POST /present          {rect?: {x,y,w,h}} start (or move the crop), {stop: true} end
 //                        ({stop: true, from: "viewer"}: ended from the page, the agent is told
 //                         with "[browser] action=present-stop")
+// GET  /script           presentation script + player position
+// POST /script           {script: {rect?, steps: [{go?, say: string[], hold?}]}} load (keeps position)
+// POST /player           {cmd: "resume" | "pause" | "goto", at?: "3" | "3.2"}
 
 import { createTerminal, type SocketData } from "./terminal.ts";
 import { panesRoute } from "./panes.ts";
@@ -24,7 +29,8 @@ import { mkdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
-import { createScreencast, type Rect } from "./screencast.ts";
+import { createPlayer, parsePos, parseScript, type PlayerInfo } from "./player.ts";
+import { createScreencast, type Inspected, type Rect } from "./screencast.ts";
 
 export type ServerOptions = {
   port: number;
@@ -123,7 +129,22 @@ export function parseRect(r: any): Rect | null {
   return { x, y, w, h };
 }
 
-export type Present = { on: boolean; rect?: Rect; since?: string };
+// Annotation prompt: the viewer's request plus the element it points at, in
+// 3 lines (request / selector / element summary).
+export function formatAnnotation(text: string, t: any): string | null {
+  if (!t || typeof t.selector !== "string" || !t.selector || t.selector.length > 1000) return null;
+  const clean = (v: unknown, n: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+  const request = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join(" / ");
+  const r = t.rect ?? {};
+  const [x, y, w, h] = [r.x, r.y, r.w, r.h].map((v) => Math.round(Number(v) || 0));
+  const label = clean(t.label, 120);
+  const snippet = clean(t.text, 80);
+  const url = clean(t.url, 300);
+  const info = [`요소: ${label}${snippet ? ` "${snippet}"` : ""}`, `위치 ${x},${y} 크기 ${w}x${h}`, url].filter(Boolean);
+  return [request, `대상: ${clean(t.selector, 1000)}`, info.join(" · ")].join("\n");
+}
+
+export type Present = { on: boolean; rect?: Rect; since?: string; player?: PlayerInfo };
 
 type Status =
   | { alive: false; reason: string; pane: string }
@@ -351,10 +372,67 @@ export async function startServer(opts: ServerOptions) {
   // short-lived bubbles. rect: crop of the visible viewport (unset = whole screen).
 
   let present: Present = { on: false };
+  const presentView = (): Present => ({ ...present, player: player.info() });
   function setPresent(next: Present) {
     present = next;
     screen.setClip(next.on ? (next.rect ?? null) : null);
-    broadcast("present", present);
+    if (!next.on) player.stop();
+    broadcast("present", presentView());
+  }
+
+  // Script player: agello owns order and timing, the agent owns the deck
+  // (each step's `go`) and decides when to resume after a question.
+  const player = createPlayer({
+    async go(expr) {
+      const js = expr.startsWith("#") ? `location.hash = ${JSON.stringify(expr)}` : expr;
+      if (!(await screen.evaluate(js))) console.error(`present: go failed: ${expr}`);
+    },
+    say(text, at, hold) {
+      broadcast("message", { role: "assistant", text, ts: new Date().toISOString(), script: at, hold });
+    },
+    done() {
+      const n = player.info().steps;
+      promptAgent("present-done", `대본 끝까지 재생함 (${n}장)`);
+    },
+    changed() {
+      broadcast("present", presentView());
+    },
+  });
+
+  // "마지막 표시 3.2 · 다음 3.3" for agent notices
+  const where = () => {
+    const i = player.info();
+    if (i.state === "empty") return "";
+    return [i.last && `마지막 표시 ${i.last}`, i.next && `다음 ${i.next}`].filter(Boolean).join(" · ");
+  };
+
+  async function scriptRequest(req: Request): Promise<Response> {
+    if (req.method !== "POST") return Response.json({ script: player.script(), player: player.info() });
+    const data = (await req.json().catch(() => ({}))) as { script?: unknown };
+    const script = parseScript(data.script);
+    if (typeof script === "string") return Response.json({ ok: false, error: script }, { status: 400 });
+    if (script.rect && !parseRect(script.rect))
+      return Response.json({ ok: false, error: "invalid_rect" }, { status: 400 });
+    player.load(script);
+    return Response.json({ ok: true, player: player.info() });
+  }
+
+  async function playerRequest(req: Request): Promise<Response> {
+    const data = (await req.json().catch(() => ({}))) as { cmd?: string; at?: string };
+    let error: string | null = null;
+    if (data.cmd === "resume") {
+      if (!present.on) {
+        const rect = player.script()?.rect;
+        setPresent({ on: true, rect: rect ? parseRect(rect)! : undefined, since: new Date().toISOString() });
+      }
+      error = player.resume();
+    } else if (data.cmd === "pause") player.pause();
+    else if (data.cmd === "goto") {
+      const pos = parsePos(data.at ?? "");
+      error = pos ? await player.goto(pos) : "invalid_position";
+    } else error = "unknown_cmd";
+    if (error) return Response.json({ ok: false, error, player: player.info() }, { status: 400 });
+    return Response.json({ ok: true, player: player.info() });
   }
 
   async function presentRequest(req: Request): Promise<Response> {
@@ -366,10 +444,11 @@ export async function startServer(opts: ServerOptions) {
       // (The CLI stop comes from the agent itself and needs no notice.)
       let notified: string | undefined;
       if (was && data.from === "viewer") {
-        const r = await promptAgent("present-stop", "사용자가 페이지에서 발표를 종료함");
+        const at = where();
+        const r = await promptAgent("present-stop", `사용자가 페이지에서 발표를 종료함${at ? ` (대본 정지: ${at})` : ""}`);
         notified = r.ok ? "ok" : r.error;
       }
-      return Response.json({ ok: true, present, notified });
+      return Response.json({ ok: true, present: presentView(), notified });
     }
     let rect: Rect | undefined;
     if (data.rect != null) {
@@ -377,7 +456,7 @@ export async function startServer(opts: ServerOptions) {
       if (!rect) return Response.json({ ok: false, error: "invalid_rect" }, { status: 400 });
     }
     setPresent({ on: true, rect, since: present.on ? present.since : new Date().toISOString() });
-    return Response.json({ ok: true, present });
+    return Response.json({ ok: true, present: presentView() });
   }
 
   // ----- HTTP -----
@@ -418,7 +497,7 @@ export async function startServer(opts: ServerOptions) {
           tools: [...pendingTools.keys()],
         });
         if (lastStatus) send(c, "status", lastStatus);
-        send(c, "present", present);
+        send(c, "present", presentView());
         for (const t of pendingTools.values()) send(c, "tool_start", t);
         ping = setInterval(() => send(c, "ping", {}), 15000);
       },
@@ -443,11 +522,24 @@ export async function startServer(opts: ServerOptions) {
   }
 
   async function sendPrompt(req: Request): Promise<Response> {
-    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string; images?: unknown };
+    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string; images?: unknown; target?: Inspected };
     const action = /^[\w-]{1,32}$/.test(data.action ?? "") ? data.action! : "message";
+    let text = data.text ?? "";
+    if (action === "annotate") {
+      const t = formatAnnotation(text, data.target);
+      if (!t || !text.trim()) return Response.json({ ok: false, error: "invalid_target" }, { status: 400 });
+      text = t;
+    }
+    // Raised hand: stop the script at once (no agent round trip) and tell the
+    // agent where it stopped.
+    if (action === "hand-raise") {
+      player.pause();
+      const at = where();
+      if (at) text += ` (대본 정지: ${at})`;
+    }
     const images = await saveImages(data.images);
     if (!images) return Response.json({ ok: false, error: "invalid_images" }, { status: 400 });
-    const text = [data.text ?? "", ...images.map((p) => `[image: ${p}]`)].join("\n");
+    text = [text, ...images.map((p) => `[image: ${p}]`)].join("\n");
     const r = await promptAgent(action, text);
     return r.ok ? Response.json({ ok: true }) : Response.json({ ok: false, error: r.error }, { status: r.status });
   }
@@ -463,7 +555,7 @@ export async function startServer(opts: ServerOptions) {
           ...(await checkStatus()),
           browser: opts.browser,
           screen: await screen.describe(),
-          present,
+          present: presentView(),
         });
       case "/events":
         return events();
@@ -488,7 +580,12 @@ export async function startServer(opts: ServerOptions) {
         }
         break;
       case "/present":
-        return req.method === "POST" ? presentRequest(req) : Response.json(present);
+        return req.method === "POST" ? presentRequest(req) : Response.json(presentView());
+      case "/script":
+        return scriptRequest(req);
+      case "/player":
+        if (req.method === "POST") return playerRequest(req);
+        break;
     }
     return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
   }
@@ -500,9 +597,25 @@ export async function startServer(opts: ServerOptions) {
     websocket: {
       maxPayloadLength: 128 * 1024,
       open(ws) { if (ws.data.kind === "terminal") terminal.open(ws); },
-      message(ws, msg) {
-        if (ws.data.kind === "terminal") terminal.message(ws, String(msg));
-        else screen.input(String(msg));
+      async message(ws, msg) {
+        const raw = String(msg);
+        if (ws.data.kind === "terminal") return terminal.message(ws, raw);
+        let m: any;
+        try {
+          m = JSON.parse(raw);
+        } catch {
+          return;
+        }
+        if (m?.inspect) {
+          const q = m.inspect;
+          const query =
+            typeof q.selector === "string"
+              ? { selector: q.selector.slice(0, 1000), full: !!q.full }
+              : { x: Number(q.x) || 0, y: Number(q.y) || 0, full: !!q.full };
+          ws.send(JSON.stringify({ id: m.id, result: await screen.inspect(query) }));
+          return;
+        }
+        screen.input(raw);
       },
       close(ws) { if (ws.data.kind === "terminal") terminal.close(ws); },
     },

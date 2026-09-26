@@ -27,6 +27,13 @@ Usage:
                          whole screen), with agent replies as bubbles that fade after 10s.
                          Run again to move the crop.
   ${NAME} present stop [--port N|--pane ID]       End presentation mode (bubbles stay in the chat)
+  ${NAME} script load <file.json>   Load a presentation script (keeps the current position):
+                         {"rect": "x,y,w,h", "steps": [{"go": "#1", "say": ["line", ...], "hold": 6}]}
+                         go: "#n" sets location.hash, otherwise JS run in the page; one line = one bubble
+  ${NAME} script show               Script with positions (step.line) and player state
+  ${NAME} present resume            Play the script from where it stopped (starts presentation mode)
+  ${NAME} present pause             Stop the script (raising a hand on the page also pauses)
+  ${NAME} present goto <n[.m]>      Move to step n (line m) and show its screen
   ${NAME} help | --version
 
 start options:
@@ -284,6 +291,56 @@ async function cmdOpen(argv: string[]) {
   console.log(inst.url);
 }
 
+async function api(url: string, path: string, body?: object): Promise<any> {
+  try {
+    const r = await fetch(`${url}${path}`, {
+      method: body ? "POST" : "GET",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(8000),
+    });
+    return await r.json();
+  } catch {
+    return fail(`server unreachable: ${url}`);
+  }
+}
+
+const playerLine = (p: any) =>
+  `script: ${p.state}${p.last ? ` last=${p.last}` : ""}${p.next ? ` next=${p.next}` : ""} steps=${p.steps}`;
+
+async function cmdScript(argv: string[]) {
+  const { values: o, positionals } = parseArgs({
+    args: argv,
+    options: { port: { type: "string" }, pane: { type: "string" } },
+    allowPositionals: true,
+  });
+  const [sub, file] = positionals;
+  const inst = await resolveTarget(o);
+  if (sub === "load") {
+    if (!file) fail("usage: script load <file.json>");
+    let script: unknown;
+    try {
+      script = await Bun.file(file!).json();
+    } catch (e) {
+      fail(`cannot read ${file}: ${(e as Error).message}`);
+    }
+    const res = await api(inst.url, "/script", { script });
+    if (!res.ok) fail(res.error);
+    console.log(playerLine(res.player));
+  } else if (sub === "show" || !sub) {
+    const res = await api(inst.url, "/script");
+    console.log(playerLine(res.player));
+    for (const [i, st] of (res.script?.steps ?? []).entries()) {
+      console.log(`${i + 1}${st.go ? `  go=${st.go}` : ""}${st.hold ? `  hold=${st.hold}s` : ""}`);
+      st.say.forEach((l: string, j: number) => {
+        const at = `${i + 1}.${j + 1}`;
+        const mark = at === res.player.next ? ">" : at === res.player.last ? "*" : " ";
+        console.log(` ${mark} ${at}  ${l}`);
+      });
+    }
+  } else fail(`unknown script command: ${sub}`);
+}
+
 async function cmdPresent(argv: string[]) {
   const { values: o, positionals } = parseArgs({
     args: argv,
@@ -291,6 +348,14 @@ async function cmdPresent(argv: string[]) {
     allowPositionals: true,
   });
   const inst = await resolveTarget(o);
+  const [sub, at] = positionals;
+  if (sub === "resume" || sub === "pause" || sub === "goto") {
+    if (sub === "goto" && !at) fail("usage: present goto <n[.m]>");
+    const res = await api(inst.url, "/player", { cmd: sub, at });
+    if (!res.ok) fail(`${res.error}${res.player ? ` (${playerLine(res.player)})` : ""}`);
+    console.log(playerLine(res.player));
+    return;
+  }
   const arg = positionals.join(",");
   let body: object;
   if (arg === "stop") body = { stop: true };
@@ -336,6 +401,9 @@ switch (cmd) {
     break;
   case "present":
     await cmdPresent(rest);
+    break;
+  case "script":
+    await cmdScript(rest);
     break;
   case "--version":
   case "-v":

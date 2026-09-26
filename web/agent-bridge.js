@@ -12,6 +12,9 @@
 //   no-history   do not persist chat in localStorage (default: persisted per server + pane)
 //   screen       show live terminal-browser screen panel (side by side, stacked when narrow)
 //                with a toggle that lets the viewer control the browser (mouse, wheel, keyboard)
+//                and an annotate toggle: hovering tints the element under the pointer, clicking
+//                outlines it and opens an input; the request goes to the agent with the element's
+//                CSS selector (action=annotate). The wheel still scrolls the page.
 //
 // Theming (CSS custom properties on the element or an ancestor)
 //   --ab-bg --ab-panel --ab-text --ab-muted --ab-line --ab-accent --ab-user --ab-font
@@ -42,9 +45,12 @@
 //   closing it without asking sends action=hand-lower so it can go on.
 //   The viewer's questions show as bubbles too, with the same 10s lifetime.
 //   An end button above it stops the presentation for every viewer.
+//   Script lines (`agello script` + `present resume`) arrive as agent messages
+//   with `script: "step.line"`. While the script is not playing and the agent
+//   is working (e.g. answering a question), a small loader is shown.
 //
 // Methods
-//   el.send(text, action = 'message', images = [{type, data (base64)}]) -> Promise<{ok, error?}>
+//   el.send(text, action = 'message', extra) -> Promise<{ok, error?}>  (extra: {images: [{type, data (base64)}]}, {target} for annotate)
 //   el.clearHistory()                  clear saved chat for the current pane
 //   el.stopPresent()                   end presentation mode, tell the agent -> Promise<{ok, error?, notified?}>
 
@@ -75,7 +81,7 @@ const SCREEN_REASONS = {
 };
 const ACTIONS = {
   message: "메시지", approve: "승인", reject: "거절",
-  "present-stop": "발표 종료", "hand-raise": "손들기", "hand-lower": "손 내림",
+  "present-stop": "발표 종료", "hand-raise": "손들기", "hand-lower": "손 내림", annotate: "주석",
 };
 
 const CSS = `
@@ -228,6 +234,30 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { .control-btn .track, .control-btn .knob { transition: none; } }
 .placeholder { font-size: 13px; color: var(--_muted); text-align: center; }
 
+/* annotate: hover tint, selected outline, request input next to the element */
+.annot-btn { flex: none; font-size: 12px; padding: 2px 10px; border-radius: 999px; }
+.annot-btn[aria-pressed="true"] { background: var(--_accent); border-color: var(--_accent); color: #fff; }
+.viewport.annot img { cursor: crosshair; }
+.hl { position: absolute; z-index: 3; pointer-events: none; display: none; border-radius: 2px; }
+.hl.on { display: block; }
+.hl.hover { background: color-mix(in srgb, var(--_accent) 22%, transparent);
+            box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--_accent) 55%, transparent); }
+.hl.sel { box-shadow: 0 0 0 2px var(--_accent), 0 0 0 5px color-mix(in srgb, var(--_accent) 25%, transparent); }
+.hl-label { position: absolute; z-index: 4; pointer-events: none; display: none; max-width: 60%;
+  padding: 2px 7px; border-radius: 5px; font: 11px/1.5 ui-monospace, Menlo, monospace; color: #fff;
+  background: rgba(20, 20, 22, .85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hl-label.on { display: block; }
+.note { position: absolute; z-index: 5; width: min(340px, calc(100% - 16px)); padding: 10px; border-radius: 12px;
+  background: var(--_panel); border: 1px solid var(--_line); box-shadow: 0 8px 28px rgba(0,0,0,.22);
+  animation: capIn .18s ease; }
+.note[hidden] { display: none; }
+.note .note-target { font: 11px/1.4 ui-monospace, Menlo, monospace; color: var(--_muted); margin-bottom: 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note textarea { min-height: 52px; font-size: 14px; }
+.note .note-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.note .note-hint { flex: 1; font-size: 12px; color: var(--_muted); }
+@media (prefers-reduced-motion: reduce) { .note { animation: none; } }
+
 /* presentation mode: the screen panel covers the window, chat stays hidden underneath.
    container-type would make the host the containing block of the fixed layer, so drop it. */
 :host([presenting]) { container-type: normal; }
@@ -254,6 +284,14 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .caption pre { background: rgba(255,255,255,.1); padding: 8px 10px; border-radius: 8px; overflow-x: auto; }
 .caption a { color: inherit; }
 @keyframes capIn { from { opacity: 0; translate: 0 10px; } }
+
+/* agent busy while presenting (answering, fixing the script): minimal loader */
+.busy { display: none; }
+.body.present .busy.on { position: absolute; left: 22px; bottom: 28px; z-index: 5; display: flex; align-items: center;
+  gap: 9px; padding: 9px 14px; border-radius: 999px; font-size: 13px; color: #fff; background: rgba(20, 20, 22, .72);
+  -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); box-shadow: 0 8px 30px rgba(0,0,0,.35);
+  animation: capIn .25s ease; }
+.busy .spinner { border-color: rgba(255,255,255,.25); border-top-color: #fff; }
 
 /* raise hand: ask the agent mid-presentation */
 .hand-wrap { display: none; }
@@ -401,9 +439,13 @@ const TEMPLATE = `
 </section>
 <aside class="screen" part="screen">
   <div class="screen-bar"><span class="live" hidden>에이전트 조작 중</span><span class="url"></span>
+    <button class="annot-btn" type="button" aria-pressed="false" title="화면의 요소를 골라 에이전트에게 요청 (선택자와 함께 전달)">주석</button>
     <button class="control-btn" role="switch" aria-checked="false" title="켜면 마우스와 키보드 입력이 브라우저로 전달돼요 (끄기: Shift+Esc)">
       <span>내 조작</span><span class="track"><span class="knob"></span></span><span class="state-label">OFF</span></button></div>
-  <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div><div class="captions" part="captions" aria-live="polite"></div>
+  <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div><div class="hl hover"></div><div class="hl sel"></div><div class="hl-label"></div>
+    <form class="note" part="note" hidden><div class="note-target"></div><textarea aria-label="선택한 요소에 대한 요청" placeholder="이 요소에 대한 요청 (Enter 전송, Esc 취소)"></textarea>
+      <div class="note-row"><span class="note-hint"></span><button type="submit" class="primary">보내기</button></div></form><div class="captions" part="captions" aria-live="polite"></div>
+    <div class="busy" part="busy" role="status"><span class="spinner"></span><span>답변 준비 중</span></div>
     <div class="hand-wrap">
       <form class="ask" part="ask" hidden><textarea aria-label="에이전트에게 질문" placeholder="에이전트에게 질문 (Enter 전송, Esc 닫기)"></textarea>
         <div class="ask-row"><span class="ask-hint"></span><button type="submit" class="primary">보내기</button></div></form>
@@ -422,7 +464,14 @@ class AgentBridge extends HTMLElement {
   #root = this.attachShadow({ mode: "open" });
   #es = null;
   #screenEs = null;
-  #controlWs = null;
+  #ws = null; // /input: control input and annotate inspect queries
+  #control = false;
+  #annot = false;
+  #hover = null; // inspected element under the pointer (annotate)
+  #hoverPt = null;
+  #sel = null; // selected element (annotate)
+  #inspectId = 0;
+  #inspectWait = new Map();
   #terminalCleanup = null;
   #terminalVersion = 0;
   #terminalStyles = null;
@@ -455,7 +504,9 @@ class AgentBridge extends HTMLElement {
       live: q(".live"), url: q(".screen-bar .url"), viewport: q(".viewport"), img: q(".viewport img"),
       controlBtn: q(".control-btn"), kbd: q(".kbd"),
       body: q(".body"), screen: q(".screen"), captions: q(".captions"),
-      hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
+      busy: q(".busy"), hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
+      annotBtn: q(".annot-btn"), hlHover: q(".hl.hover"), hlSel: q(".hl.sel"), hlLabel: q(".hl-label"),
+      note: q(".note"), noteBox: q(".note textarea"), noteHint: q(".note-hint"), noteTarget: q(".note-target"),
     };
     this.$.buttons.forEach((b) => b.addEventListener("click", () => this.#submit(b.dataset.action)));
     this.#bindGrip();
@@ -467,6 +518,7 @@ class AgentBridge extends HTMLElement {
     });
     loadMarkdown().then((md) => (this.#md = md));
     this.#bindControl();
+    this.#bindAnnotate();
     this.#bindHand();
     q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
@@ -490,6 +542,7 @@ class AgentBridge extends HTMLElement {
     this.#screenEs?.close();
     this.#screenEs = null;
     this.#setControl(false);
+    this.#setAnnotate(false);
   }
   attributeChangedCallback(name) {
     if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "agello";
@@ -506,6 +559,7 @@ class AgentBridge extends HTMLElement {
     q(".term-btn").setAttribute("aria-pressed", String(on));
     if (!on) return;
     this.#setControl(false);
+    this.#setAnnotate(false);
     q(".terminal-status").textContent = "터미널 로딩 중…";
     try {
       if (!this.#terminalStyles) {
@@ -772,12 +826,12 @@ class AgentBridge extends HTMLElement {
     }));
   }
 
-  async send(text, action = "message", images = []) {
+  async send(text, action = "message", extra = {}) {
     try {
       const res = await fetch(`${this.server}/send`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, text, images: images.length ? images : undefined }),
+        body: JSON.stringify({ ...extra, action, text }),
       });
       return await res.json();
     } catch {
@@ -816,7 +870,8 @@ class AgentBridge extends HTMLElement {
     on("message", (m) => {
       this.#addMessage(m);
       this.#saveMessage(m);
-      if (this.#present.on && m.role === "assistant") this.#caption(m.text);
+      // script lines carry their own on-screen time (>= 10s), others use CAPTION_MS
+      if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined);
       if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
       this.#emit("agent-message", m);
     });
@@ -842,7 +897,7 @@ class AgentBridge extends HTMLElement {
 
   #syncScreen() {
     const want = this.hasAttribute("screen") || this.#present.on;
-    if (!want) { this.#screenEs?.close(); this.#screenEs = null; this.#setControl(false); return; }
+    if (!want) { this.#screenEs?.close(); this.#screenEs = null; this.#setControl(false); this.#setAnnotate(false); return; }
     if (this.#screenEs) return;
     const es = (this.#screenEs = new EventSource(`${this.server}/screen`));
     es.addEventListener("meta", (e) => this.#renderScreenMeta(JSON.parse(e.data)));
@@ -851,6 +906,7 @@ class AgentBridge extends HTMLElement {
       this.#frame = { w: f.w, h: f.h };
       this.$.img.src = `data:image/jpeg;base64,${f.data}`;
       this.$.viewport.classList.add("has");
+      if (this.#annot) this.#annotFrame();
     });
     es.onerror = () => this.#renderScreenMeta({ connected: false });
   }
@@ -862,8 +918,9 @@ class AgentBridge extends HTMLElement {
     const was = this.#present.on;
     this.#present = p ?? { on: false };
     this.#emit("agent-present", this.#present);
+    this.#renderBusy();
     if (on === was) return;
-    if (on) { this.#showTerminal(false); this.#setControl(false); }
+    if (on) { this.#showTerminal(false); this.#setControl(false); this.#setAnnotate(false); }
     else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#handUp = false; }
     this.#syncScreen();
     // FLIP: grow from (or shrink back to) the side panel
@@ -877,6 +934,12 @@ class AgentBridge extends HTMLElement {
       `scale(${before.width / after.width}, ${before.height / after.height})`;
     screen.animate([{ transformOrigin: "0 0", transform: t }, { transformOrigin: "0 0", transform: "none" }],
       { duration: on ? 420 : 360, easing: "cubic-bezier(.2, .7, .2, 1)" });
+  }
+
+  #renderBusy() {
+    const s = this.#status;
+    const busy = this.#present.on && s?.alive && s.status === "working" && this.#present.player?.state !== "playing";
+    this.$.busy.classList.toggle("on", !!busy);
   }
 
   // Raise hand: open a small input over the presentation and send it as a message.
@@ -938,7 +1001,7 @@ class AgentBridge extends HTMLElement {
 
   // Agent reply as a short-lived bubble over the presented screen.
   // kind "user": the viewer's own question (plain text, accent colour).
-  #caption(text, kind = "agent") {
+  #caption(text, kind = "agent", ms = AgentBridge.CAPTION_MS) {
     if (!text?.trim()) return;
     const el = document.createElement("div");
     el.className = `caption ${kind}`;
@@ -953,7 +1016,7 @@ class AgentBridge extends HTMLElement {
       el.classList.add("out");
       setTimeout(() => el.remove(), 500);
     };
-    setTimeout(leave, AgentBridge.CAPTION_MS);
+    setTimeout(leave, ms);
     const live = [...box.children].filter((c) => !c.classList.contains("out"));
     live.slice(0, Math.max(0, live.length - AgentBridge.CAPTION_MAX)).forEach((c) => c.__leave?.());
     el.__leave = leave;
@@ -996,24 +1059,43 @@ class AgentBridge extends HTMLElement {
 
   // ---------- user control ----------
 
-  #setControl(on) {
-    if (on && !this.#controlWs) {
+  // One socket for both modes; open while control or annotate is on.
+  #syncWs() {
+    const want = this.#control || this.#annot;
+    if (want && !this.#ws) {
       const ws = new WebSocket(`${this.server.replace(/^http/, "ws")}/input`);
-      ws.onclose = () => { if (this.#controlWs === ws) this.#setControl(false); };
-      this.#controlWs = ws;
-    } else if (!on && this.#controlWs) {
-      const ws = this.#controlWs;
-      this.#controlWs = null;
+      ws.onmessage = (e) => {
+        let m;
+        try { m = JSON.parse(e.data); } catch { return; }
+        this.#inspectWait.get(m.id)?.(m.result ?? null);
+      };
+      ws.onclose = () => {
+        if (this.#ws !== ws) return;
+        this.#ws = null;
+        this.#setControl(false);
+        this.#setAnnotate(false);
+      };
+      this.#ws = ws;
+    } else if (!want && this.#ws) {
+      const ws = this.#ws;
+      this.#ws = null;
       ws.close();
     }
-    this.$.controlBtn.setAttribute("aria-checked", String(!!this.#controlWs));
-    this.$.controlBtn.querySelector(".state-label").textContent = this.#controlWs ? "ON" : "OFF";
-    this.$.viewport.classList.toggle("control", !!this.#controlWs);
-    if (this.#controlWs) this.$.kbd.focus();
+    if (!this.#ws) { this.#inspectWait.forEach((r) => r(null)); this.#inspectWait.clear(); }
+  }
+
+  #setControl(on) {
+    this.#control = !!on && !this.#present.on;
+    if (this.#control) this.#setAnnotate(false);
+    this.#syncWs();
+    this.$.controlBtn.setAttribute("aria-checked", String(this.#control));
+    this.$.controlBtn.querySelector(".state-label").textContent = this.#control ? "ON" : "OFF";
+    this.$.viewport.classList.toggle("control", this.#control);
+    if (this.#control) this.$.kbd.focus();
   }
 
   #cdp(method, params) {
-    const ws = this.#controlWs;
+    const ws = this.#ws;
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ method, params }));
   }
 
@@ -1027,11 +1109,11 @@ class AgentBridge extends HTMLElement {
 
   #bindControl() {
     const { img, kbd, controlBtn } = this.$;
-    const on = () => !!this.#controlWs && this.#frame.w > 0;
+    const on = () => this.#control && this.#frame.w > 0;
     const mods = (e) => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
     const BUTTONS = ["left", "middle", "right"];
 
-    controlBtn.addEventListener("click", () => { if (!this.#present.on) this.#setControl(!this.#controlWs); });
+    controlBtn.addEventListener("click", () => this.#setControl(!this.#control));
 
     img.addEventListener("mousedown", (e) => {
       if (!on()) return;
@@ -1059,7 +1141,7 @@ class AgentBridge extends HTMLElement {
       });
     });
     img.addEventListener("wheel", (e) => {
-      if (!on()) return;
+      if (!on() && !(this.#annot && this.#frame.w > 0)) return; // annotate: scroll to reach the element
       e.preventDefault();
       this.#cdp("Input.dispatchMouseEvent", { type: "mouseWheel", ...this.#point(e), deltaX: e.deltaX, deltaY: e.deltaY,
         modifiers: mods(e) });
@@ -1097,6 +1179,163 @@ class AgentBridge extends HTMLElement {
     });
   }
 
+  // ---------- annotate ----------
+
+  #setAnnotate(on) {
+    on = !!on && !this.#present.on;
+    if (on === this.#annot) return;
+    this.#annot = on;
+    if (on) this.#setControl(false);
+    else { this.#hover = null; this.#hoverPt = null; this.#select(null); }
+    this.#syncWs();
+    this.$.annotBtn.setAttribute("aria-pressed", String(on));
+    this.$.viewport.classList.toggle("annot", on);
+    this.#drawHl();
+  }
+
+  // Element at a frame point ({x, y}) or by selector; null if unavailable.
+  #inspect(q, full = false) {
+    const ws = this.#ws;
+    if (ws?.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+    const id = ++this.#inspectId;
+    return new Promise((resolve) => {
+      const done = (r) => { clearTimeout(t); this.#inspectWait.delete(id); resolve(r); };
+      const t = setTimeout(() => done(null), 3000);
+      this.#inspectWait.set(id, done);
+      ws.send(JSON.stringify({ id, inspect: { ...q, full } }));
+    });
+  }
+
+  // Latest pointer position wins; at most one hover query in flight.
+  #probing = false;
+  #probeAgain = false;
+  async #probeHover() {
+    if (this.#probing) { this.#probeAgain = true; return; }
+    this.#probing = true;
+    try {
+      do {
+        this.#probeAgain = false;
+        const p = this.#hoverPt;
+        if (!p || !this.#annot) break;
+        const r = await this.#inspect(p);
+        if (this.#hoverPt && this.#annot) { this.#hover = r; this.#drawHl(); }
+      } while (this.#probeAgain);
+    } finally {
+      this.#probing = false;
+    }
+  }
+
+  // The page changed (scroll, layout, HMR): follow the selected element and
+  // re-check what is under the pointer.
+  #tracking = false;
+  async #annotFrame() {
+    if (this.#hoverPt) this.#probeHover();
+    const sel = this.#sel;
+    if (!sel || this.#tracking) { this.#drawHl(); return; }
+    this.#tracking = true;
+    try {
+      const r = await this.#inspect({ selector: sel.selector });
+      if (r && this.#sel === sel) sel.rect = r.rect; // gone from the page: keep the last box
+    } finally {
+      this.#tracking = false;
+    }
+    this.#drawHl();
+  }
+
+  #select(t) {
+    const { note, noteBox, noteHint, noteTarget } = this.$;
+    this.#sel = t;
+    note.hidden = !t;
+    noteHint.textContent = "";
+    if (t) {
+      noteTarget.textContent = t.selector;
+      noteTarget.title = t.selector;
+      noteBox.focus();
+    }
+    this.#drawHl();
+  }
+
+  // Frame (CSS px of the page viewport) -> position over the displayed image.
+  #drawHl() {
+    const { viewport, img, hlHover, hlSel, hlLabel, note } = this.$;
+    const show = this.#annot && viewport.classList.contains("has") && this.#frame.w > 0;
+    const vr = viewport.getBoundingClientRect();
+    const ir = img.getBoundingClientRect();
+    const sx = ir.width / this.#frame.w, sy = ir.height / this.#frame.h;
+    const box = (r) => {
+      if (!show || !r) return null;
+      const x0 = Math.max(r.x, 0), y0 = Math.max(r.y, 0);
+      const x1 = Math.min(r.x + r.w, this.#frame.w), y1 = Math.min(r.y + r.h, this.#frame.h);
+      if (x1 <= x0 || y1 <= y0) return null;
+      return { left: ir.left - vr.left + x0 * sx, top: ir.top - vr.top + y0 * sy, width: (x1 - x0) * sx, height: (y1 - y0) * sy };
+    };
+    const place = (el, b) => {
+      el.classList.toggle("on", !!b);
+      if (b) Object.assign(el.style, { left: `${b.left}px`, top: `${b.top}px`, width: `${b.width}px`, height: `${b.height}px` });
+      return b;
+    };
+    const hb = place(hlHover, box(this.#hover?.rect));
+    const sb = place(hlSel, box(this.#sel?.rect));
+
+    hlLabel.classList.toggle("on", !!hb);
+    if (hb) {
+      const r = this.#hover.rect;
+      hlLabel.textContent = `${this.#hover.label}  ${Math.round(r.w)}×${Math.round(r.h)}`;
+      // above the box, else below it, else inside its top edge
+      const top = hb.top >= 22 ? hb.top - 22 : hb.top + hb.height + 26 <= vr.height ? hb.top + hb.height + 4 : hb.top + 4;
+      Object.assign(hlLabel.style, { left: `${hb.left + (top === hb.top + 4 ? 4 : 0)}px`, top: `${top}px` });
+    }
+
+    // input below the selected element, above it if there is no room
+    if (!note.hidden) {
+      const W = note.offsetWidth, H = note.offsetHeight, pad = 8;
+      const b = sb ?? { left: pad, top: pad, width: 0, height: 0 };
+      let top = b.top + b.height + pad;
+      if (top + H > vr.height - pad) top = b.top - H - pad;
+      top = Math.max(pad, Math.min(top, vr.height - H - pad));
+      const left = Math.max(pad, Math.min(b.left, vr.width - W - pad));
+      Object.assign(note.style, { left: `${left}px`, top: `${top}px` });
+    }
+  }
+
+  #bindAnnotate() {
+    const { img, annotBtn, note, noteBox, noteHint } = this.$;
+    annotBtn.addEventListener("click", () => this.#setAnnotate(!this.#annot));
+    img.addEventListener("mousemove", (e) => {
+      if (!this.#annot || !this.#frame.w) return;
+      this.#hoverPt = this.#point(e);
+      this.#probeHover();
+    });
+    img.addEventListener("mouseleave", () => {
+      if (!this.#annot) return;
+      this.#hoverPt = null;
+      this.#hover = null;
+      this.#drawHl();
+    });
+    img.addEventListener("click", async (e) => {
+      if (!this.#annot || !this.#frame.w) return;
+      e.preventDefault();
+      const t = await this.#inspect(this.#point(e), true);
+      if (t && this.#annot) this.#select(t);
+    });
+    new ResizeObserver(() => this.#drawHl()).observe(img);
+    note.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = noteBox.value.trim();
+      const target = this.#sel;
+      if (!text || !target) return;
+      noteHint.textContent = "보내는 중…";
+      const res = await this.send(text, "annotate", { target });
+      if (!res.ok) { noteHint.textContent = `전송 실패: ${res.error}`; return; }
+      noteBox.value = "";
+      if (this.#sel === target) this.#select(null);
+    });
+    noteBox.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); note.requestSubmit(); }
+      if (e.key === "Escape") { e.preventDefault(); this.#select(null); }
+    });
+  }
+
   #renderScreenMeta(m) {
     const { live, url, viewport } = this.$;
     if (!m.connected) {
@@ -1112,6 +1351,7 @@ class AgentBridge extends HTMLElement {
       url.textContent = m.title ? `${m.title} · ${m.url}` : m.url || "";
       url.title = m.url || "";
     }
+    this.#drawHl();
     this.#emit("agent-screen", m);
   }
 
@@ -1248,7 +1488,7 @@ class AgentBridge extends HTMLElement {
       return;
     } else if (m.role === "assistant") {
       wrap.className = "msg assistant";
-      meta.textContent = `에이전트 · ${time}`;
+      meta.textContent = `에이전트${m.script ? ` · 대본 ${m.script}` : ""} · ${time}`;
       if (this.#md) bubble.innerHTML = this.#md(m.text);
       else { bubble.textContent = m.text; bubble.classList.add("plain"); }
     } else if (m.role === "browser") {
@@ -1310,6 +1550,7 @@ class AgentBridge extends HTMLElement {
     this.$.buttons.forEach((b) => (b.disabled = !canSend));
     if (!s || !s.alive || s.status === "idle") this.#tools.clear();
     this.#renderActivity();
+    this.#renderBusy();
     this.#emit("agent-status", s);
   }
 
@@ -1318,7 +1559,7 @@ class AgentBridge extends HTMLElement {
     const images = this.#images.map(({ type, data }) => ({ type, data }));
     if (action === "message" && !text && !images.length) return;
     this.$.buttons.forEach((b) => (b.disabled = true));
-    const res = await this.send(text, action, images);
+    const res = await this.send(text, action, { images: images.length ? images : undefined });
     if (res.ok) {
       this.$.box.value = "";
       this.$.hint.textContent = "";

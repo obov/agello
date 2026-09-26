@@ -1,6 +1,6 @@
 {
   "name": "agello",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Talk to a coding agent in a herdr pane from the browser: chat, live status, and a shared browser screen.",
   "keywords": [
     "herdr",
