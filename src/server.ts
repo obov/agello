@@ -4,8 +4,10 @@
 // GET  /agent-bridge.js  <agent-bridge> web component
 // GET  /status           session liveness (herdr agent get + pane get)
 // GET  /events           SSE: status, chat messages, tool start/end (from transcript JSONL)
-// POST /send             {action, text} -> herdr agent prompt
+// POST /send             {action, text, images?: [{type, data(base64)}]} -> herdr agent prompt
+//                        (images are saved to $TMPDIR/agello-uploads and sent as [image: <path>])
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
+// POST /upload           {images: [{type, data(base64)}]} -> {paths}: terminal image paste
 // WS   /terminal         interactive herdr terminal frames, keyboard input, resize
 // GET  /panes            herdr workspace -> tab -> pane tree
 // POST /panes/connect    {pane} -> url of that pane's server (started if needed)
@@ -18,7 +20,8 @@
 
 import { createTerminal, type SocketData } from "./terminal.ts";
 import { panesRoute } from "./panes.ts";
-import { homedir } from "node:os";
+import { mkdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
 import { createScreencast, type Rect } from "./screencast.ts";
@@ -32,6 +35,30 @@ export type ServerOptions = {
 };
 
 export const BROWSER_PREFIX = "[browser]";
+const UPLOAD_DIR = join(tmpdir(), "agello-uploads");
+const IMAGE_EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+const MAX_IMAGES = 5;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+// Save pasted/dropped chat images so the agent can open them by path
+// (herdr agent prompt carries text only). null: invalid input.
+export async function saveImages(list: unknown): Promise<string[] | null> {
+  if (list === undefined) return [];
+  if (!Array.isArray(list) || list.length > MAX_IMAGES) return null;
+  const files = list.map((img: any) => {
+    const ext = IMAGE_EXT[img?.type];
+    if (!ext || typeof img.data !== "string") return null;
+    const bytes = Buffer.from(img.data, "base64");
+    return bytes.length && bytes.length <= MAX_IMAGE_BYTES ? { ext, bytes } : null;
+  });
+  if (files.includes(null)) return null;
+  await mkdir(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+  return Promise.all(files.map(async (f) => {
+    const path = join(UPLOAD_DIR, `${crypto.randomUUID()}.${f!.ext}`);
+    await Bun.write(path, f!.bytes);
+    return path;
+  }));
+}
 const WEB_DIR = join(import.meta.dir, "..", "web");
 
 // ---------- pure helpers ----------
@@ -416,9 +443,12 @@ export async function startServer(opts: ServerOptions) {
   }
 
   async function sendPrompt(req: Request): Promise<Response> {
-    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string };
+    const data = (await req.json().catch(() => ({}))) as { action?: string; text?: string; images?: unknown };
     const action = /^[\w-]{1,32}$/.test(data.action ?? "") ? data.action! : "message";
-    const r = await promptAgent(action, data.text ?? "");
+    const images = await saveImages(data.images);
+    if (!images) return Response.json({ ok: false, error: "invalid_images" }, { status: 400 });
+    const text = [data.text ?? "", ...images.map((p) => `[image: ${p}]`)].join("\n");
+    const r = await promptAgent(action, text);
     return r.ok ? Response.json({ ok: true }) : Response.json({ ok: false, error: r.error }, { status: r.status });
   }
 
@@ -449,6 +479,13 @@ export async function startServer(opts: ServerOptions) {
         });
       case "/send":
         if (req.method === "POST") return sendPrompt(req);
+        break;
+      case "/upload":
+        if (req.method === "POST") {
+          const data = (await req.json().catch(() => ({}))) as { images?: unknown };
+          const paths = data.images === undefined ? null : await saveImages(data.images);
+          return paths ? Response.json({ ok: true, paths }) : Response.json({ ok: false, error: "invalid_images" }, { status: 400 });
+        }
         break;
       case "/present":
         return req.method === "POST" ? presentRequest(req) : Response.json(present);

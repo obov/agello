@@ -67,6 +67,38 @@ export function mountTerminal(host, status, server) {
       lines: Math.min(100, Math.max(1, Math.ceil(Math.abs(event.deltaY) / 40))) });
   };
   host.addEventListener("wheel", wheel, { passive: false, capture: true });
+  // xterm pastes text only. For images (a Finder file copy or a screenshot),
+  // upload the file the browser received and paste its path, as a local
+  // terminal does for a dropped file: Claude Code attaches image paths.
+  // (Sending Ctrl+V instead would make Claude Code read the system clipboard,
+  // which for a Finder copy holds the file icon, not the image.)
+  const paste = async (event) => {
+    const data = event.clipboardData;
+    if (!ready || !data) return;
+    const files = [...data.items].filter((i) => i.kind === "file" && i.type.startsWith("image/")).map((i) => i.getAsFile());
+    if (!files.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    status.textContent = "이미지 올리는 중…";
+    try {
+      const images = await Promise.all(files.slice(0, 5).map((f) => new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve({ type: f.type, data: String(r.result).split(",")[1] });
+        r.onerror = reject;
+        r.readAsDataURL(f);
+      })));
+      const res = await fetch(`${server}/upload`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ images }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error);
+      send({ type: "terminal.input", text: `\x1b[200~${d.paths.join(" ")}\x1b[201~` });
+      status.textContent = "터미널 연결됨 · 키보드 입력 가능";
+    } catch {
+      status.textContent = "이미지를 올리지 못했습니다. (PNG·JPEG·GIF·WebP, 10MB 이하)";
+    }
+  };
+  host.addEventListener("paste", paste, true);
   const observer = new ResizeObserver(() => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
@@ -81,6 +113,7 @@ export function mountTerminal(host, status, server) {
     clearTimeout(resizeTimer);
     observer.disconnect();
     host.removeEventListener("wheel", wheel, true);
+    host.removeEventListener("paste", paste, true);
     ws.close();
     term.dispose();
     host.replaceChildren();

@@ -86,3 +86,12 @@ test("streams ANSI, preserves keyboard bytes, resizes, and releases exclusive co
   await until(() => c.ws.readyState === WebSocket.CLOSED);
   expect(c.frames.at(-1).type).toBe("terminal.error");
 });
+
+test("uploads pasted terminal images and returns their paths", async () => {
+  const png = Buffer.from("89504e470d0a1a0a", "hex").toString("base64");
+  const ok = await (await fetch(bridge.url + "/upload", { method: "POST", body: JSON.stringify({ images: [{ type: "image/png", data: png }] }) })).json();
+  expect(ok.paths[0]).toMatch(/agello-uploads\/[\w-]+\.png$/);
+  await rm(ok.paths[0]);
+  expect((await fetch(bridge.url + "/upload", { method: "POST", body: JSON.stringify({ images: [{ type: "text/plain", data: png }] }) })).status).toBe(400);
+  expect((await fetch(bridge.url + "/upload", { method: "POST", headers: { Origin: "https://untrusted.example" }, body: "{}" })).status).toBe(403);
+});

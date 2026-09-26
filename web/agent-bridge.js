@@ -44,7 +44,7 @@
 //   An end button above it stops the presentation for every viewer.
 //
 // Methods
-//   el.send(text, action = 'message') -> Promise<{ok, error?}>
+//   el.send(text, action = 'message', images = [{type, data (base64)}]) -> Promise<{ok, error?}>
 //   el.clearHistory()                  clear saved chat for the current pane
 //   el.stopPresent()                   end presentation mode, tell the agent -> Promise<{ok, error?, notified?}>
 
@@ -359,6 +359,13 @@ button.primary { background: var(--_accent); border-color: var(--_accent); color
 button:disabled { cursor: not-allowed; opacity: .45; }
 :host([no-actions]) .secondary { display: none; }
 .hint { font-size: 12px; color: var(--_muted); }
+.attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.attachments:empty { display: none; }
+.attachment { position: relative; width: 64px; height: 64px; border: 1px solid var(--_line); border-radius: 8px; overflow: hidden; }
+.attachment img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.attachment button { position: absolute; top: 2px; right: 2px; padding: 0 6px; font-size: 12px; line-height: 1.5;
+                     border-radius: 999px; background: rgb(0 0 0 / .6); border: 0; color: #fff; }
+.composer.dragover textarea { outline: 2px dashed var(--_accent); outline-offset: -1px; }
 `;
 
 const TEMPLATE = `
@@ -382,7 +389,8 @@ const TEMPLATE = `
 </div>
 <footer part="composer"><div class="composer">
   <div class="grip" role="separator" aria-orientation="horizontal" aria-label="입력창 높이 조절 (위아래 방향키)" tabindex="0" title="끌어서 입력창 높이 조절"></div>
-  <textarea placeholder="에이전트에게 보낼 메시지 (Enter 전송, Shift+Enter 줄바꿈)"></textarea>
+  <textarea placeholder="에이전트에게 보낼 메시지 (Enter 전송, Shift+Enter 줄바꿈, 이미지 붙여넣기·끌어놓기)"></textarea>
+  <div class="attachments" aria-label="첨부 이미지"></div>
   <div class="row">
     <button class="secondary" data-action="approve">승인</button>
     <button class="secondary" data-action="reject">거절</button>
@@ -421,6 +429,9 @@ class AgentBridge extends HTMLElement {
   #panes = null; // {current, workspaces}
   #expanded = new Set();
   #adding = null; // {kind, workspace?, pane?}
+  #images = []; // chat attachments: {type, data (base64), url (preview)}
+  static IMAGE_MAX = 5;
+  static IMAGE_BYTES = 10 * 1024 * 1024;
   #frame = { w: 0, h: 0 };
   #moveQueued = null;
   #status = null;
@@ -460,6 +471,7 @@ class AgentBridge extends HTMLElement {
     q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
     this.#bindPanes();
+    this.#bindImages();
   }
 
   get server() {
@@ -693,12 +705,79 @@ class AgentBridge extends HTMLElement {
     }
   }
 
-  async send(text, action = "message") {
+  // ---------- image attachments (paste / drop into the chat box) ----------
+
+  #bindImages() {
+    const composer = this.#root.querySelector(".composer");
+    const images = (list) => [...(list ?? [])].filter((f) => f.type?.startsWith("image/"));
+    this.$.box.addEventListener("paste", (e) => {
+      const files = images([...(e.clipboardData?.items ?? [])].filter((i) => i.kind === "file").map((i) => i.getAsFile()));
+      if (!files.length) return;
+      if (!e.clipboardData.getData("text/plain")) e.preventDefault();
+      this.#addImages(files);
+    });
+    composer.addEventListener("dragover", (e) => {
+      if (![...(e.dataTransfer?.items ?? [])].some((i) => i.kind === "file")) return;
+      e.preventDefault();
+      composer.classList.add("dragover");
+    });
+    composer.addEventListener("dragleave", (e) => { if (!composer.contains(e.relatedTarget)) composer.classList.remove("dragover"); });
+    composer.addEventListener("drop", (e) => {
+      composer.classList.remove("dragover");
+      const files = images(e.dataTransfer?.files);
+      if (!files.length) return;
+      e.preventDefault();
+      this.#addImages(files);
+    });
+    this.#root.querySelector(".attachments").addEventListener("click", (e) => {
+      const i = e.target.closest("[data-remove]")?.dataset.remove;
+      if (i === undefined) return;
+      URL.revokeObjectURL(this.#images[i].url);
+      this.#images.splice(Number(i), 1);
+      this.#renderImages();
+    });
+  }
+
+  async #addImages(files) {
+    const ok = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+    for (const f of files) {
+      if (this.#images.length >= AgentBridge.IMAGE_MAX) { this.$.hint.textContent = `이미지는 최대 ${AgentBridge.IMAGE_MAX}개`; break; }
+      if (!ok.includes(f.type)) { this.$.hint.textContent = "PNG, JPEG, GIF, WebP만 첨부 가능"; continue; }
+      if (f.size > AgentBridge.IMAGE_BYTES) { this.$.hint.textContent = "이미지 1개당 최대 10MB"; continue; }
+      const data = await new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(",")[1]);
+        r.onerror = reject;
+        r.readAsDataURL(f);
+      });
+      this.#images.push({ type: f.type, data, url: URL.createObjectURL(f) });
+    }
+    this.#renderImages();
+  }
+
+  #renderImages() {
+    this.#root.querySelector(".attachments").replaceChildren(...this.#images.map((img, i) => {
+      const wrap = document.createElement("div");
+      wrap.className = "attachment";
+      const pic = document.createElement("img");
+      pic.src = img.url;
+      pic.alt = `첨부 이미지 ${i + 1}`;
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.textContent = "×";
+      rm.dataset.remove = String(i);
+      rm.setAttribute("aria-label", `첨부 이미지 ${i + 1} 삭제`);
+      wrap.append(pic, rm);
+      return wrap;
+    }));
+  }
+
+  async send(text, action = "message", images = []) {
     try {
       const res = await fetch(`${this.server}/send`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, text }),
+        body: JSON.stringify({ action, text, images: images.length ? images : undefined }),
       });
       return await res.json();
     } catch {
@@ -1236,10 +1315,17 @@ class AgentBridge extends HTMLElement {
 
   async #submit(action) {
     const text = this.$.box.value.trim();
-    if (action === "message" && !text) return;
+    const images = this.#images.map(({ type, data }) => ({ type, data }));
+    if (action === "message" && !text && !images.length) return;
     this.$.buttons.forEach((b) => (b.disabled = true));
-    const res = await this.send(text, action);
-    if (res.ok) { this.$.box.value = ""; this.$.hint.textContent = ""; }
+    const res = await this.send(text, action, images);
+    if (res.ok) {
+      this.$.box.value = "";
+      this.$.hint.textContent = "";
+      this.#images.forEach((img) => URL.revokeObjectURL(img.url));
+      this.#images = [];
+      this.#renderImages();
+    }
     else this.$.hint.textContent = `전송 실패: ${res.error}`;
     this.#renderStatus(this.#status);
     this.$.box.focus();
