@@ -9,6 +9,7 @@
 // line is sent and held for its reading time (see PACE). pause() stops at once and keeps
 // the position, resume() re-runs the current step's `go` (the agent may have
 // moved the screen meanwhile) and continues from the next unshown line.
+// rewind() (after a raised hand) moves back so the last shown line plays again.
 // goto() moves the position and shows that step without playing.
 //
 // Positions are "step.line", 1-based, in everything that leaves this module.
@@ -199,6 +200,15 @@ export function createPlayer(deps: {
       if (state !== "playing") return;
       cancel();
       set("paused");
+    },
+
+    // Paused by an interruption (raised hand): the next resume replays the
+    // last shown line, since the viewer may have missed it.
+    rewind() {
+      if (state !== "paused" || !last) return;
+      cur = { ...last };
+      entered = false;
+      deps.changed();
     },
 
     // Move to a step (and line) and show its screen. Does not play; if it was

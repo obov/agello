@@ -42,7 +42,9 @@
 //   A raise-hand button next to the bubbles opens a small input so the viewer
 //   can ask the agent something mid-presentation (sent as action=message).
 //   Opening it tells the agent right away (action=hand-raise) so it can pause;
-//   closing it without asking sends action=hand-lower so it can go on.
+//   closing it with X (or Esc) before asking sends action=hand-lower so it can go on.
+//   The input stays open while the agent answers, for follow-up questions; X
+//   (or Esc) sends action=hand-done so the agent resumes the presentation.
 //   The viewer's questions show as bubbles too, with the same 10s lifetime.
 //   An end button above it stops the presentation for every viewer.
 //   Script lines (`agello script` + `present resume`) arrive as agent messages
@@ -81,7 +83,7 @@ const SCREEN_REASONS = {
 };
 const ACTIONS = {
   message: "메시지", approve: "승인", reject: "거절",
-  "present-stop": "발표 종료", "hand-raise": "손들기", "hand-lower": "손 내림", annotate: "주석",
+  "present-stop": "발표 종료", "hand-raise": "손들기", "hand-lower": "손 내림", "hand-done": "질문 완료", annotate: "주석",
 };
 
 const CSS = `
@@ -276,6 +278,9 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
   box-shadow: 0 8px 30px rgba(0, 0, 0, .35); animation: capIn .3s ease; }
 .caption.plain { white-space: pre-wrap; }
 .caption.user { background: color-mix(in srgb, var(--_accent) 88%, transparent); }
+/* system event (hand raised / lowered / done): small, light, not part of the conversation */
+.caption.event { padding: 6px 14px; border-radius: 999px; font-size: 13px; color: #1d1d1f;
+  background: rgba(255, 255, 255, .9); box-shadow: 0 4px 16px rgba(0,0,0,.25); }
 .caption.out { opacity: 0; translate: 0 6px; transition: opacity .5s ease, translate .5s ease; }
 .caption > :first-child { margin-top: 0; } .caption > :last-child { margin-bottom: 0; }
 .caption p, .caption ul, .caption ol { margin: .35em 0; }
@@ -317,6 +322,13 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .ask textarea::placeholder { color: rgba(255,255,255,.5); }
 .ask .ask-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .ask .ask-hint { font-size: 12px; color: rgba(255,255,255,.6); flex: 1; }
+.ask .ask-row .primary { margin-left: 0; }
+.ask .ask-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; color: rgba(255,255,255,.75); }
+.ask .ask-title { flex: 1; }
+.ask .ask-done { width: 28px; height: 28px; padding: 0; border-radius: 50%; display: grid; place-items: center;
+  background: transparent; color: #fff; border-color: rgba(255,255,255,.22); }
+.ask .ask-done:hover { background: rgba(255,255,255,.14); }
+.ask .ask-done svg { width: 16px; height: 16px; }
 @media (prefers-reduced-motion: reduce) { .hand, .ask { transition: none; animation: none; } }
 @media (prefers-reduced-motion: reduce) { .caption { animation: none; } .caption.out { transition: none; } }
 @container (max-width: 820px) {
@@ -447,7 +459,10 @@ const TEMPLATE = `
       <div class="note-row"><span class="note-hint"></span><button type="submit" class="primary">보내기</button></div></form><div class="captions" part="captions" aria-live="polite"></div>
     <div class="busy" part="busy" role="status"><span class="spinner"></span><span>답변 준비 중</span></div>
     <div class="hand-wrap">
-      <form class="ask" part="ask" hidden><textarea aria-label="에이전트에게 질문" placeholder="에이전트에게 질문 (Enter 전송, Esc 닫기)"></textarea>
+      <form class="ask" part="ask" hidden>
+        <div class="ask-head"><span class="ask-title"></span><button type="button" class="ask-done">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button></div>
+        <textarea aria-label="에이전트에게 질문"></textarea>
         <div class="ask-row"><span class="ask-hint"></span><button type="submit" class="primary">보내기</button></div></form>
       <button class="end" part="end" type="button" aria-label="발표 종료" title="발표 종료">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
@@ -491,6 +506,7 @@ class AgentBridge extends HTMLElement {
   #present = { on: false };
   static HISTORY_LIMIT = 500;
   static CAPTION_MS = 10000; // presentation bubble lifetime
+  static EVENT_MS = 5000; // system event bubble lifetime
   static CAPTION_MAX = 3; // bubbles on screen at once (oldest leaves early)
 
   constructor() {
@@ -505,6 +521,7 @@ class AgentBridge extends HTMLElement {
       controlBtn: q(".control-btn"), kbd: q(".kbd"),
       body: q(".body"), screen: q(".screen"), captions: q(".captions"),
       busy: q(".busy"), hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
+      askTitle: q(".ask-title"), askDone: q(".ask-done"),
       annotBtn: q(".annot-btn"), hlHover: q(".hl.hover"), hlSel: q(".hl.sel"), hlLabel: q(".hl-label"),
       note: q(".note"), noteBox: q(".note textarea"), noteHint: q(".note-hint"), noteTarget: q(".note-target"),
     };
@@ -873,6 +890,10 @@ class AgentBridge extends HTMLElement {
       // script lines carry their own on-screen time (>= 10s), others use CAPTION_MS
       if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined);
       if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
+      // a reply to the viewer's question (status polling may miss a short working phase)
+      // (the agent took the question once it is echoed in the transcript; earlier work was the hand-raise turn)
+      if (this.#qa === "asked" && m.role === "browser" && m.action === "message") this.#qaTaken = true;
+      if (this.#qa === "asked" && this.#qaTaken && m.role === "assistant" && !m.script) { this.#qaWorked = true; this.#checkAnswered(); }
       this.#emit("agent-message", m);
     });
     on("present", (p) => this.#setPresent(p));
@@ -921,7 +942,7 @@ class AgentBridge extends HTMLElement {
     this.#renderBusy();
     if (on === was) return;
     if (on) { this.#showTerminal(false); this.#setControl(false); this.#setAnnotate(false); }
-    else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#handUp = false; }
+    else { this.$.captions.replaceChildren(); this.#openAsk(false); this.#qa = null; }
     this.#syncScreen();
     // FLIP: grow from (or shrink back to) the side panel
     const { screen, body } = this.$;
@@ -940,20 +961,31 @@ class AgentBridge extends HTMLElement {
     const s = this.#status;
     const busy = this.#present.on && s?.alive && s.status === "working" && this.#present.player?.state !== "playing";
     this.$.busy.classList.toggle("on", !!busy);
+    this.#checkAnswered();
   }
 
-  // Raise hand: open a small input over the presentation and send it as a message.
+  // Raise hand: a question session over the presentation.
+  // The input stays open for the whole session; X / Esc / the hand button close it.
+  //   raised: nothing asked yet. close -> hand-lower (agent resumes)
+  //   asked:  question sent, agent answering (follow-ups can be typed already)
+  //   follow: answered, waiting for a follow-up. close -> hand-done (agent resumes)
+  // The session ends when the script plays again or the presentation stops.
+  #qa = null; // null | "raised" | "asked" | "follow"
+  #qaTaken = false; // the last question reached the agent (echoed in the transcript)
+  #qaWorked = false; // agent seen working on it
+
   #bindHand() {
     const { hand, ask, askBox, askHint } = this.$;
     hand.addEventListener("click", () => {
-      if (ask.hidden) this.#raiseHand();
-      else this.#lowerHand();
+      if (!this.#qa) this.#raiseHand();
+      else this.#closeHand();
     });
+    this.$.askDone.addEventListener("click", () => { this.#closeHand(); hand.focus(); });
     this.$.end.addEventListener("click", async () => {
       this.$.end.disabled = true;
       const res = await this.stopPresent();
       this.$.end.disabled = false;
-      if (!res.ok) { this.#openAsk(true); askHint.textContent = `발표 종료 실패: ${res.error}`; }
+      if (!res.ok) { this.#openAsk(this.#qa ?? "raised"); askHint.textContent = `발표 종료 실패: ${res.error}`; }
     });
     ask.addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -963,40 +995,85 @@ class AgentBridge extends HTMLElement {
       const res = await this.send(text, "message");
       if (!res.ok) { askHint.textContent = `전송 실패: ${res.error}`; return; }
       askBox.value = "";
-      this.#handUp = false; // the question itself ends the raised hand
-      this.#openAsk(false);
+      this.#qa = "asked";
+      this.#qaTaken = this.#qaWorked = false;
+      this.#openAsk("asked");
       hand.classList.add("sent");
       setTimeout(() => hand.classList.remove("sent"), 1500);
     });
     askBox.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask.requestSubmit(); }
-      if (e.key === "Escape") { e.preventDefault(); this.#lowerHand(); hand.focus(); }
+      if (e.key === "Escape") { e.preventDefault(); this.#closeHand(); hand.focus(); }
     });
   }
 
-  // Raise: open the input and tell the agent to pause. Lower (closed without
-  // asking): tell it to go on. Failures only show a hint; asking still works.
-  #handUp = false;
+  // Raise: open the input and tell the agent to pause. Failures only show a hint; asking still works.
   async #raiseHand() {
-    this.#openAsk(true);
-    if (this.#handUp) return;
-    this.#handUp = true;
+    this.#event("손들기 확인 · 발표 일시정지");
+    this.#qa = "raised";
+    this.#openAsk("raised");
     const res = await this.send("사용자가 손을 듦: 질문 입력 중", "hand-raise");
     if (!res.ok && !this.$.ask.hidden) this.$.askHint.textContent = `손들기 알림 실패: ${res.error}`;
   }
+  // X / Esc / hand button: before asking = cancel (hand-lower), after = resolved (hand-done).
+  #closeHand() {
+    if (this.#qa === "raised") this.#lowerHand(); else this.#doneHand();
+  }
+  // Cancel before asking: tell the agent to go on.
   async #lowerHand() {
     this.#openAsk(false);
-    if (!this.#handUp) return;
-    this.#handUp = false;
-    await this.send("사용자가 질문 없이 손을 내림", "hand-lower");
+    if (this.#qa !== "raised") return;
+    this.#qa = null;
+    this.#event("손들기 취소 · 곧 발표 재개");
+    await this.send("사용자가 질문 없이 손을 내림: 발표 계속", "hand-lower");
+  }
+  // X after an answer: the question is resolved, tell the agent to go on.
+  async #doneHand() {
+    this.#openAsk(false);
+    if (!this.#qa || this.#qa === "raised") return;
+    this.#qa = null;
+    this.#event("질문 완료 · 곧 발표 재개");
+    await this.send("사용자가 질문 완료 (추가 질문 없음): 발표 계속", "hand-done");
   }
 
-  #openAsk(open) {
-    const { hand, ask, askBox, askHint } = this.$;
-    ask.hidden = !open;
-    hand.setAttribute("aria-expanded", String(open));
+  // Answer finished (agent was working, now is not): reopen the input for a follow-up.
+  // If the script plays again (agent resumed on its own), the session is over.
+  #checkAnswered() {
+    if (!this.#qa) return;
+    if (this.#present.player?.state === "playing") {
+      if (this.#qa !== "raised") { this.#qa = null; this.#openAsk(false); }
+      return;
+    }
+    if (this.#qa !== "asked") return;
+    const s = this.#status;
+    if (s?.alive && s.status === "working") { if (this.#qaTaken) this.#qaWorked = true; return; }
+    if (this.#qaWorked && s?.alive) { this.#qa = "follow"; this.#openAsk("follow"); }
+  }
+
+  // The input stays open for the whole session. mode: false (close) | "raised" | "asked" | "follow"
+  static ASK_TEXT = {
+    raised: ["질문 입력", "에이전트에게 질문 (Enter 전송, Esc·X 취소)", "손들기 취소: 발표 계속"],
+    asked: ["답변 준비 중…", "추가 질문 (Enter 전송, Esc·X 질문 완료)", "질문 완료: 발표 계속"],
+    follow: ["추가 질문이 있으면 입력", "추가 질문 (Enter 전송, Esc·X 질문 완료)", "질문 완료: 발표 계속"],
+  };
+  #openAsk(mode) {
+    const { hand, ask, askBox, askHint, askTitle, askDone } = this.$;
+    const wasOpen = !ask.hidden;
+    ask.hidden = !mode;
+    hand.setAttribute("aria-expanded", String(!!mode));
     askHint.textContent = "";
-    if (open) askBox.focus();
+    if (!mode) return;
+    const [title, placeholder, done] = AgentBridge.ASK_TEXT[mode];
+    askTitle.textContent = title;
+    askBox.placeholder = placeholder;
+    askDone.setAttribute("aria-label", done);
+    askDone.title = done;
+    if (!wasOpen || mode !== "asked") askBox.focus();
+  }
+
+  // Instant local feedback for a hand interaction (no agent round trip).
+  #event(text) {
+    this.#caption(text, "event", AgentBridge.EVENT_MS);
   }
 
   // Agent reply as a short-lived bubble over the presented screen.
@@ -1006,7 +1083,7 @@ class AgentBridge extends HTMLElement {
     const el = document.createElement("div");
     el.className = `caption ${kind}`;
     el.part = "caption";
-    if (kind === "user") { el.textContent = text; el.classList.add("plain"); }
+    if (kind === "user" || kind === "event") { el.textContent = text; el.classList.add("plain"); }
     else if (this.#md) el.innerHTML = this.#md(text);
     else { el.textContent = text; el.classList.add("plain"); }
     const box = this.$.captions;

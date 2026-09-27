@@ -530,10 +530,11 @@ export async function startServer(opts: ServerOptions) {
       if (!t || !text.trim()) return Response.json({ ok: false, error: "invalid_target" }, { status: 400 });
       text = t;
     }
-    // Raised hand: stop the script at once (no agent round trip) and tell the
-    // agent where it stopped.
+    // Raised hand: stop the script at once (no agent round trip), rewind so
+    // resume replays the interrupted line, and tell the agent where it stopped.
     if (action === "hand-raise") {
       player.pause();
+      player.rewind();
       const at = where();
       if (at) text += ` (대본 정지: ${at})`;
     }

@@ -113,7 +113,8 @@ The xterm.js renderer and its styles are served locally; no terminal CDN is requ
 - agent replies appear over it as bubbles that fade after 10s
 - `agello present stop` returns to the normal layout; the replies are in the chat as usual
 - the viewer can ask a question with the raise-hand button (its bubble fades after 10s too) or end the presentation with the end button; the agent then receives `[browser] action=present-stop`
-- raising the hand tells the agent at once (`action=hand-raise`) so it can pause; closing the input without asking sends `action=hand-lower`
+- raising the hand tells the agent at once (`action=hand-raise`) so it can pause; closing it with X (or Esc) before asking sends `action=hand-lower`
+- the input stays open for the whole question: after the agent answers, follow-up questions go in the same input (no need to raise the hand again); X (or Esc) then sends `action=hand-done`, and the agent resumes
 
 Run `present` again to move the crop. User control is off while presenting.
 
@@ -130,7 +131,8 @@ Write the talk ahead so each line appears the moment its screen does:
 
 - step: `go` brings the screen there (`#n` sets `location.hash`, anything else is JS run in the page; agello knows nothing about the deck), `say` lines are one bubble each, `hold` seconds a line stays on screen (default from length, 10 to 20s; never below 10s). Pacing: screen change, 1s, line, fade out, 0.3s, next line; after a step's last line 0.7s before the next screen
 - `present resume` plays from where it stopped (starts presentation mode with the script's `rect`); it first re-runs the current step's `go`, so the agent may move the screen freely while answering
-- raising a hand pauses at once; the agent gets `action=hand-raise` with the position (`마지막 표시 2.1 · 다음 2.2`)
+- raising a hand pauses at once and rewinds one line, so `present resume` replays the interrupted line; the agent gets `action=hand-raise` with the position (`마지막 표시 2.1 · 다음 2.1`)
+- raising, cancelling (X before asking) and finishing a question (X after an answer) show a small light event bubble for 5s right away, apart from the conversation bubbles; sending a question shows none
 - `script load` again after editing keeps the position; `present goto 2.2` then `present resume` replays from a fixed line
 - at the end the agent gets `action=present-done`; while the script is paused and the agent is working, the page shows a small loader
 
