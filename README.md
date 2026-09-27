@@ -136,6 +136,30 @@ Write the talk ahead so each line appears the moment its screen does:
 - `script load` again after editing keeps the position; `present goto 2.2` then `present resume` replays from a fixed line
 - at the end the agent gets `action=present-done`; while the script is paused and the agent is working, the page shows a small loader
 
+#### Optional TTS and recording
+
+The screen panel's **발표 설정** remains available during presentation. TTS and recording both start OFF and can be used independently:
+
+| TTS | Recording | Result |
+|---|---|---|
+| OFF | OFF | Existing timed script captions |
+| OFF | ON | Presentation images and captions in a silent video |
+| ON | OFF | Spoken script, with captions synchronized to audio playback |
+| ON | ON | Presentation images, captions, and TTS audio in the controlling viewer's video |
+
+1. Open **발표 설정**. Enter a Typecast API key and optionally change the voice ID, then click **키·목소리 적용**. The default voice is `tc_6a0e85a97f7750959b970d5d`; the provider uses Korean (`kor`) and model `ssfm-v30`.
+2. Alternatively, **로컬 키 불러오기** reads only `TYPECAST_API_KEY` from `../yt-outlier/.env`, relative to the server's working directory. It does not execute the file or import other settings. A server started with `TYPECAST_API_KEY` in its environment also has a key ready, with TTS still OFF.
+3. Click **TTS 켜기** in the viewer that should play sound. This click grants browser audio playback permission. Click **대본 재생** after loading a script; **일시정지** stops playback, and **다시 재생** starts a completed script again from its first step.
+4. Click **녹화 시작**, then **녹화 종료** and **영상 저장** to download the recording. Recording can start before presentation if a screen image is already available. Stopping recording leaves script and audio playback running.
+
+With TTS enabled, each script caption appears after that viewer starts the actual audio, and closes when the audio finishes. The audio's duration replaces the script's `hold`; ordinary agent replies still use their existing caption timer. Raising a hand immediately stops audio locally, and resumed playback repeats the interrupted line. Pausing, changing steps, updating a script, or disconnecting cancels outdated speech. A TTS failure pauses the script; fix the key or connection, or turn TTS OFF, then resume.
+
+Only the viewer that enabled TTS plays audio and acknowledges speech progress. Other viewers receive the same captions and can record a silent video. To include TTS audio, record in the viewer that enabled TTS. Audio settings are fixed when recording starts: stop recording before changing TTS. If another viewer changes the controlling audio role, a recording whose audio setting changes is finalized automatically.
+
+Recording uses a 1280×720 canvas that fits the relayed browser image with letterboxing and draws the current captions below it. It records these images and plain caption text, rather than the page's entire DOM: chat, settings, question input, and control buttons are excluded; caption Markdown styling is flattened. Long captions are wrapped and truncated to the safe area. The canvas targets 30fps, while source screen updates can be slower (presentation screenshots are approximately 10fps). A background or minimized tab may render more slowly. Use a current Chromium browser for the verified recording path; other browsers depend on their `canvas.captureStream`, Web Audio, and `MediaRecorder` support. MP4 is preferred when supported, with WebM as a fallback. Streaming WebM duration metadata is finalized when its header supports the correction; otherwise the original browser recording is retained.
+
+Recording stops at 15 minutes or 256MB, at presentation end, on server changes, or on connection loss. Keep the page open until **영상 저장** appears and download it before closing or reloading; recording data is held in browser memory. A later recording replaces the earlier download link.
+
 ## Embed
 
 ```html
@@ -167,9 +191,11 @@ See `web/embed-example.html`.
 
 The server listens on `127.0.0.1` only. Data and input endpoints accept requests from the same origin and `localhost` pages only; other origins get `403` unless added with `--allow-origin`. Allowed origins can send chat prompts and connect to `/terminal` to type directly into the pane, so keep the allow list short.
 
+TTS keys remain in server memory until replaced, cleared with **키 삭제**, or the server stops. Password inputs are cleared after applying; keys and speech-driver tokens are never put in browser storage, chat history, scripts, or SSE broadcasts. Keys are sent only to the local server and Typecast. Script text is sent to Typecast when TTS is ON, and generated audio is cached in server memory for reuse. Allowed origins can also configure TTS and read generated audio, so allow only trusted pages.
+
 ## Development
 
-Run `bun install` and `bun test`. Tests cover the pane tree and creation (against a mock herdr), local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, and reconnect.
+Run `bun install` and `bun test`. Tests cover the pane tree and creation (against a mock herdr), local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, reconnect, TTS coordination, stale speech cancellation, and recording lifecycle and metadata.
 
 ## License
 

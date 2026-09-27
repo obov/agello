@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { runJson } from "./run.ts";
 import { createPlayer, parsePos, parseScript, type PlayerInfo } from "./player.ts";
 import { createScreencast, type Inspected, type Rect } from "./screencast.ts";
+import { createTts } from "./tts.ts";
 
 export type ServerOptions = {
   port: number;
@@ -189,12 +190,21 @@ export async function startServer(opts: ServerOptions) {
   // ----- SSE clients -----
 
   const clients = new Set<ReadableStreamDefaultController>();
+  const viewers = new Map<ReadableStreamDefaultController, string | null>();
+  const clientPings = new Map<ReadableStreamDefaultController, Timer>();
+  const dropClient = (ctrl: ReadableStreamDefaultController) => {
+    if (!clients.delete(ctrl)) return;
+    clearInterval(clientPings.get(ctrl));
+    clientPings.delete(ctrl);
+    tts.disconnect(viewers.get(ctrl) ?? null);
+    viewers.delete(ctrl);
+  };
   const enc = new TextEncoder();
   const send = (ctrl: ReadableStreamDefaultController, event: string, data: unknown) => {
     try {
       ctrl.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
     } catch {
-      clients.delete(ctrl);
+      dropClient(ctrl);
     }
   };
   const broadcast = (event: string, data: unknown) => clients.forEach((c) => send(c, event, data));
@@ -382,13 +392,16 @@ export async function startServer(opts: ServerOptions) {
 
   // Script player: agello owns order and timing, the agent owns the deck
   // (each step's `go`) and decides when to resume after a question.
+  const tts = createTts({ emit: broadcast, pause: () => player.pause() });
   const player = createPlayer({
     async go(expr) {
       const js = expr.startsWith("#") ? `location.hash = ${JSON.stringify(expr)}` : expr;
       if (!(await screen.evaluate(js))) console.error(`present: go failed: ${expr}`);
     },
-    say(text, at, hold) {
-      broadcast("message", { role: "assistant", text, ts: new Date().toISOString(), script: at, hold });
+    narrate: tts.narrate,
+    say(text, at, hold, narration) {
+      broadcast("message", { role: "assistant", text, ts: new Date().toISOString(), script: at, hold,
+        ...(narration ? { narration } : {}) });
     },
     done() {
       const n = player.info().steps;
@@ -482,13 +495,15 @@ export async function startServer(opts: ServerOptions) {
     return res;
   }
 
-  function events(): Response {
+  function events(viewer: string | null): Response {
     let ctrl!: ReadableStreamDefaultController;
     let ping: Timer;
     const stream = new ReadableStream({
       start(c) {
         ctrl = c;
         clients.add(c);
+        viewers.set(c, viewer);
+        tts.connect(viewer);
         send(c, "hello", {
           transcript: !!transcript,
           pane: PANE,
@@ -498,12 +513,16 @@ export async function startServer(opts: ServerOptions) {
         });
         if (lastStatus) send(c, "status", lastStatus);
         send(c, "present", presentView());
+        send(c, "tts", tts.status());
+        const narration = tts.currentNarration();
+        if (narration) send(c, "message", { role: "assistant", ts: new Date().toISOString(), ...narration });
         for (const t of pendingTools.values()) send(c, "tool_start", t);
         ping = setInterval(() => send(c, "ping", {}), 15000);
+        clientPings.set(c, ping);
       },
       cancel() {
         clearInterval(ping);
-        clients.delete(ctrl);
+        dropClient(ctrl);
       },
     });
     return new Response(stream, {
@@ -546,6 +565,8 @@ export async function startServer(opts: ServerOptions) {
   }
 
   async function route(req: Request, url: URL): Promise<Response> {
+    const ttsResponse = await tts.handle(req, url.pathname);
+    if (ttsResponse) return ttsResponse;
     if (url.pathname.startsWith("/panes")) {
       const res = await panesRoute(req, url.pathname, PANE);
       if (res) return res;
@@ -559,7 +580,7 @@ export async function startServer(opts: ServerOptions) {
           present: presentView(),
         });
       case "/events":
-        return events();
+        return events(url.searchParams.get("viewer"));
       case "/screen":
         return screen.handle();
       case "/terminal.js":
@@ -568,6 +589,10 @@ export async function startServer(opts: ServerOptions) {
         return new Response(terminalCSS, { headers: { "Content-Type": "text/css; charset=utf-8" } });
       case "/agent-bridge.js":
         return new Response(COMPONENT, {
+          headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" },
+        });
+      case "/presentation-media.js":
+        return new Response(Bun.file(join(WEB_DIR, "presentation-media.js")), {
           headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" },
         });
       case "/send":
@@ -623,7 +648,7 @@ export async function startServer(opts: ServerOptions) {
     async fetch(req, server) {
       const url = new URL(req.url);
       const origin = req.headers.get("Origin");
-      const isScript = ["/agent-bridge.js", "/terminal.js", "/terminal.css"].includes(url.pathname);
+      const isScript = ["/agent-bridge.js", "/presentation-media.js", "/terminal.js", "/terminal.css"].includes(url.pathname);
 
       // The component script itself is public; data and input endpoints are origin-checked.
       if (!isScript && !originAllowed(origin, url.origin))
@@ -657,6 +682,15 @@ export async function startServer(opts: ServerOptions) {
     session: SESSION,
     transcript,
     stop() {
+      player.stop();
+      tts.stop();
+      for (const client of clients) {
+        clearInterval(clientPings.get(client));
+        try { client.close(); } catch {}
+      }
+      clients.clear();
+      viewers.clear();
+      clientPings.clear();
       terminal.stop();
       timers.forEach(clearInterval);
       server.stop(true);

@@ -23,6 +23,7 @@ export type PlayerInfo = {
   next?: string; // next line to show ("3.2")
   last?: string; // last line shown
   steps: number;
+  error?: string;
 };
 
 // Pacing: the audience looks at a new screen first, then reads and thinks.
@@ -80,7 +81,10 @@ export function parsePos(v: string): { step: number; line: number } | null {
 
 export function createPlayer(deps: {
   go: (expr: string) => Promise<void>;
-  say: (text: string, at: string, hold: number) => void;
+  say: (text: string, at: string, hold: number, narration?: string) => void;
+  // null selects text pacing; a promise resolves only after actual playback ends.
+  narrate?: (text: string, at: string, signal: AbortSignal,
+    started: (duration: number, id: string) => void) => Promise<void> | null;
   done: () => void;
   changed: () => void;
 }) {
@@ -91,6 +95,8 @@ export function createPlayer(deps: {
   let entered = false; // `go` of cur.step already run in this play run
   let run = 0; // bumps on every pause/goto/load, stale timers check it
   let timer: Timer | null = null;
+  let speech: AbortController | null = null;
+  let error: string | undefined;
 
   const fmt = (p: { step: number; line: number }) => `${p.step + 1}.${p.line + 1}`;
   const set = (s: PlayerInfo["state"]) => {
@@ -101,6 +107,8 @@ export function createPlayer(deps: {
     run++;
     if (timer) clearTimeout(timer);
     timer = null;
+    speech?.abort();
+    speech = null;
   };
   const wait = (ms: number, id: number, fn: () => void) => {
     timer = setTimeout(() => id === run && fn(), ms);
@@ -117,6 +125,7 @@ export function createPlayer(deps: {
       steps,
       next: script && p.step < steps ? fmt(p) : undefined,
       last: last ? fmt(last) : undefined,
+      ...(error ? { error } : {}),
     };
   }
 
@@ -155,13 +164,38 @@ export function createPlayer(deps: {
       return;
     }
     const text = step.say[cur.line];
-    const hold = lineHold(text, step.hold);
+    const position = { ...cur };
     const lastLine = cur.line === step.say.length - 1;
+    const gap = lastLine ? PACE.afterStep : PACE.betweenLines;
+    speech = new AbortController();
+    const narration = deps.narrate?.(text, fmt(cur), speech.signal, (duration, narrationId) => {
+      if (id !== run || state !== "playing") return;
+      last = position;
+      deps.say(text, fmt(position), duration, narrationId);
+      deps.changed();
+    });
+    if (narration) {
+      try {
+        await narration;
+        if (id !== run || state !== "playing") return;
+        speech = null;
+        cur = { step: position.step, line: position.line + 1 };
+        deps.changed();
+        wait(PACE.fade + gap, id, () => tick(id));
+      } catch {
+        if (id !== run) return;
+        cancel();
+        error = "narration_failed";
+        set("paused");
+      }
+      return;
+    }
+    speech = null;
+    const hold = lineHold(text, step.hold);
     last = { ...cur };
     deps.say(text, fmt(cur), hold);
     cur = { step: cur.step, line: cur.line + 1 };
     deps.changed();
-    const gap = lastLine ? PACE.afterStep : PACE.betweenLines;
     wait(hold * 1000 + PACE.fade + gap, id, () => tick(id));
   }
 
@@ -173,6 +207,7 @@ export function createPlayer(deps: {
     load(next: Script) {
       const playing = state === "playing";
       cancel();
+      error = undefined;
       script = next;
       if (cur.step > next.steps.length) cur = { step: next.steps.length, line: 0 };
       normalize();
@@ -190,6 +225,7 @@ export function createPlayer(deps: {
       if (state === "playing") return null;
       if (state === "done") return "done";
       cancel();
+      error = undefined;
       entered = false; // bring the screen back to the current step first
       set("playing");
       tick(run);
@@ -220,6 +256,7 @@ export function createPlayer(deps: {
       if (pos.line > 0 && pos.line >= step.say.length) return "no_such_line";
       const playing = state === "playing";
       cancel();
+      error = undefined;
       cur = { ...pos };
       entered = false;
       if (playing) {
@@ -235,8 +272,8 @@ export function createPlayer(deps: {
 
     // Presentation ended: stop where it is.
     stop() {
+      cancel();
       if (state === "playing") {
-        cancel();
         set("paused");
       }
     },

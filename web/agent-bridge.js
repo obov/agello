@@ -56,6 +56,8 @@
 //   el.clearHistory()                  clear saved chat for the current pane
 //   el.stopPresent()                   end presentation mode, tell the agent -> Promise<{ok, error?, notified?}>
 
+import { PresentationMedia, DEFAULT_VOICE } from "./presentation-media.js";
+
 const SCRIPT_ORIGIN = new URL(import.meta.url).origin;
 
 let mdPromise;
@@ -80,6 +82,28 @@ const SCREEN_REASONS = {
   no_browser_in_tab: "이 herdr 탭에 열린 terminal-browser 없음",
   tab_unknown: "에이전트의 herdr 탭을 확인할 수 없음",
   no_active_tab: "브라우저에 활성 탭 없음",
+};
+const MEDIA_ERRORS = {
+  tts_key_required: "Typecast API 키를 적용한 뒤 TTS를 켜 주세요.",
+  tts_invalid_key: "Typecast API 키가 올바르지 않아요. 키를 확인한 뒤 다시 재생해 주세요.",
+  tts_local_key_unavailable: "로컬 키를 찾지 못했어요. ../yt-outlier/.env의 TYPECAST_API_KEY를 확인하거나 키를 직접 입력해 주세요.",
+  tts_driver_disconnected: "음성을 재생하던 화면의 연결이 끊겼어요. 이 화면에서 TTS를 켠 뒤 다시 재생해 주세요.",
+  tts_prepare_timeout: "음성 생성 시간이 초과됐어요. 연결을 확인하고 다시 재생해 주세요.",
+  tts_start_timeout: "음성이 시작되지 않았어요. TTS 켜기로 음성 재생을 허용한 뒤 다시 재생해 주세요.",
+  tts_end_timeout: "음성 완료를 확인하지 못했어요. 연결을 확인하고 다시 재생해 주세요.",
+  tts_playback_error: "음성을 재생하지 못했어요. TTS 켜기로 음성 재생을 허용한 뒤 다시 재생해 주세요.",
+  tts_provider_error: "Typecast 요청이 실패했어요. 키·목소리·사용 한도를 확인하고 다시 재생해 주세요.",
+  tts_network_error: "Typecast에 연결하지 못했어요. 인터넷 연결을 확인하고 다시 재생해 주세요.",
+  tts_text_limit: "대본 한 줄이 너무 길어요. 2,000자 이하로 나눠 주세요.",
+  tts_invalid_audio: "올바른 음성을 받지 못했어요. 목소리 설정을 확인하고 다시 재생해 주세요.",
+  tts_audio_not_found: "준비된 음성이 만료됐어요. 대본을 다시 재생해 주세요.",
+  tts_failed: "TTS 처리에 실패했어요. 설정을 확인하고 다시 재생하거나 TTS를 꺼 주세요.",
+  tts_cancelled: "음성 생성이 취소됐어요. 계속하려면 대본을 다시 재생해 주세요.",
+  tts_config_superseded: "TTS 설정이 변경됐어요. 현재 설정을 확인하고 다시 적용해 주세요.",
+  tts_stopped: "음성 재생이 종료됐어요. 계속하려면 TTS를 켠 뒤 대본을 재생해 주세요.",
+  invalid_voice: "목소리 ID가 올바르지 않아요. Typecast 목소리 ID를 확인해 주세요.",
+  invalid_viewer: "발표 화면 연결을 확인하지 못했어요. 페이지를 새로 고친 뒤 다시 시도해 주세요.",
+  invalid_tts_config: "TTS 설정이 올바르지 않아요. 키와 목소리 ID를 확인해 주세요.",
 };
 const ACTIONS = {
   message: "메시지", approve: "승인", reject: "거절",
@@ -175,6 +199,21 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 .screen-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; font-size: 12px; color: var(--_muted);
               border-bottom: 1px solid var(--_line); min-width: 0; }
 .screen-bar .url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.screen { position: relative; }
+.media-controls { padding: 7px 12px; border-bottom: 1px solid var(--_line); font-size: 12px; background: var(--_panel); z-index: 6; }
+.media-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.media-toolbar button { padding: 3px 9px; border-radius: 7px; font-size: 12px; }
+.media-record[aria-pressed="true"] { color: #c92a2a; border-color: #c92a2a; }
+.media-download { color: var(--_accent); }
+.media-panel { max-width: 420px; display: grid; gap: 8px; padding: 12px 0 4px; }
+.media-panel[hidden], .media-download[hidden] { display: none; }
+.media-panel label { display: grid; gap: 3px; }
+.media-panel input { min-width: 0; width: 100%; padding: 6px 8px; font: inherit; color: var(--_text); background: var(--_bg); border: 1px solid var(--_line); border-radius: 6px; }
+.media-panel .media-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.media-status { margin: 4px 0 0; color: var(--_muted); overflow-wrap: anywhere; }
+.media-status.error { color: #c92a2a; }
+.media-note { color: var(--_muted); }
+.body.present .media-controls { position: absolute; top: 12px; right: 12px; left: 12px; width: fit-content; max-width: calc(100% - 24px); border: 1px solid var(--_line); border-radius: 10px; box-shadow: 0 4px 16px rgb(0 0 0 / .2); }
 .live[hidden] { display: none; }
 .live { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--_line); }
 .live.on { background: var(--_accent); border-color: var(--_accent); color: #fff; }
@@ -454,6 +493,18 @@ const TEMPLATE = `
     <button class="annot-btn" type="button" aria-pressed="false" title="화면의 요소를 골라 에이전트에게 요청 (선택자와 함께 전달)">주석</button>
     <button class="control-btn" role="switch" aria-checked="false" title="켜면 마우스와 키보드 입력이 브라우저로 전달돼요 (끄기: Shift+Esc)">
       <span>내 조작</span><span class="track"><span class="knob"></span></span><span class="state-label">OFF</span></button></div>
+  <div class="media-controls" aria-label="발표 설정 및 녹화">
+    <div class="media-toolbar"><button type="button" class="media-settings" aria-expanded="false">발표 설정</button>
+      <button type="button" class="media-play">대본 재생</button><button type="button" class="media-record" aria-pressed="false">녹화 시작</button>
+      <span class="media-elapsed"></span><a class="media-download" hidden>영상 저장</a></div>
+    <div class="media-panel" hidden role="group" aria-label="TTS 설정">
+      <label>Typecast API 키<input class="media-key" type="password" autocomplete="off" placeholder="키는 서버 메모리에만 보관해요"></label>
+      <label>목소리 ID<input class="media-voice" type="text" spellcheck="false" value="${DEFAULT_VOICE}"></label>
+      <div class="media-actions"><button type="button" class="media-save">키·목소리 적용</button><button type="button" class="media-local">로컬 키 불러오기</button><button type="button" class="media-clear">키 삭제</button></div>
+      <button type="button" class="media-tts" aria-pressed="false">TTS 켜기</button>
+      <span class="media-note">TTS와 녹화는 각각 선택해요. 발표 화면 이미지와 대본을 녹화하며, TTS 음성은 TTS를 켠 제어 화면의 녹화에만 담겨요. 최대 15분·256MB.</span>
+    </div><p class="media-status" role="status" aria-live="polite"></p>
+  </div>
   <div class="viewport"><div class="ring"></div><div class="glow"></div><div class="agent-badge">에이전트 조작 중</div><img alt="에이전트 브라우저 화면" draggable="false"><textarea class="kbd" aria-label="브라우저 키보드 입력"></textarea><div class="placeholder">열린 terminal-browser 없음</div><div class="hl hover"></div><div class="hl sel"></div><div class="hl-label"></div>
     <form class="note" part="note" hidden><div class="note-target"></div><textarea aria-label="선택한 요소에 대한 요청" placeholder="이 요소에 대한 요청 (Enter 전송, Esc 취소)"></textarea>
       <div class="note-row"><span class="note-hint"></span><button type="submit" class="primary">보내기</button></div></form><div class="captions" part="captions" aria-live="polite"></div>
@@ -504,6 +555,10 @@ class AgentBridge extends HTMLElement {
   #historyKey = null;
   #history = [];
   #present = { on: false };
+  #viewerId = crypto.randomUUID();
+  #media;
+  #mediaBusy = false;
+  #mediaConnection = 0;
   static HISTORY_LIMIT = 500;
   static CAPTION_MS = 10000; // presentation bubble lifetime
   static EVENT_MS = 5000; // system event bubble lifetime
@@ -541,6 +596,7 @@ class AgentBridge extends HTMLElement {
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
     this.#bindPanes();
     this.#bindImages();
+    this.#bindMedia();
   }
 
   get server() {
@@ -553,6 +609,9 @@ class AgentBridge extends HTMLElement {
     this.#syncScreen();
   }
   disconnectedCallback() {
+    this.#mediaConnection++;
+    this.#media.reset(this.server, true);
+    this.$.captions.replaceChildren();
     this.#showTerminal(false);
     this.#es?.close();
     this.#es = null;
@@ -875,7 +934,13 @@ class AgentBridge extends HTMLElement {
 
   #connect() {
     this.#es?.close();
-    const es = (this.#es = new EventSource(`${this.server}/events`));
+    this.#media.reset(this.server);
+    this.$.captions.replaceChildren();
+    const version = ++this.#mediaConnection;
+    const es = (this.#es = new EventSource(`${this.server}/events?viewer=${encodeURIComponent(this.#viewerId)}`));
+    this.#media.request("/tts").then((config) => {
+      if (version === this.#mediaConnection) this.#media.setConfig(config);
+    }).catch((error) => { if (version === this.#mediaConnection) this.#media.report(error); });
     const on = (name, fn) => es.addEventListener(name, (e) => fn(JSON.parse(e.data)));
     on("hello", (d) => {
       if (!d.transcript) this.$.hint.textContent = "대화 기록 파일 없음: 메시지 표시 불가";
@@ -885,10 +950,15 @@ class AgentBridge extends HTMLElement {
     on("unqueued", ({ id }) => { this.#unqueue(id); this.#emit("agent-queue", { phase: "unqueued", id }); });
     on("status", (s) => this.#renderStatus(s));
     on("message", (m) => {
-      this.#addMessage(m);
-      this.#saveMessage(m);
+      // Joining during speech replays its caption snapshot, which may already
+      // be in this pane's saved history. Keep the live caption without a duplicate row.
+      const replayedNarration = typeof m.narration === "string" && this.#history.some((saved) => saved.narration === m.narration);
+      if (!replayedNarration) {
+        this.#addMessage(m);
+        this.#saveMessage(m);
+      }
       // script lines carry their own on-screen time (>= 10s), others use CAPTION_MS
-      if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined);
+      if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined, typeof m.narration === "string" ? m.narration : null);
       if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
       // a reply to the viewer's question (status polling may miss a short working phase)
       // (the agent took the question once it is echoed in the transcript; earlier work was the hand-raise turn)
@@ -897,6 +967,8 @@ class AgentBridge extends HTMLElement {
       this.#emit("agent-message", m);
     });
     on("present", (p) => this.#setPresent(p));
+    on("tts", (config) => this.#media.setConfig(config));
+    on("speech", (event) => { void this.#media.handleSpeech(event); });
     on("tool_start", (t) => {
       this.#tools.set(t.id, t);
       this.#renderActivity();
@@ -913,7 +985,12 @@ class AgentBridge extends HTMLElement {
       this.#setToolState(t.id, t.isError ? "error" : "done");
       this.#emit("agent-tool", { phase: "end", ...t });
     });
-    es.onerror = () => { this.#renderStatus(null); this.#setPresent({ on: false }); };
+    es.onerror = () => {
+      this.#mediaConnection++;
+      this.#media.reset(this.server);
+      this.#renderStatus(null); this.#setPresent({ on: false });
+      this.#media.report("서버 연결이 끊겨 음성과 녹화를 종료했어요. 다시 연결한 뒤 TTS를 켜 주세요.");
+    };
   }
 
   #syncScreen() {
@@ -934,10 +1011,104 @@ class AgentBridge extends HTMLElement {
 
   // ---------- presentation mode ----------
 
+  #bindMedia() {
+    const q = (selector) => this.#root.querySelector(selector);
+    this.#media = new PresentationMedia({
+      viewerId: this.#viewerId, image: this.$.img,
+      captions: () => [...this.$.captions.children].filter((el) => !el.classList.contains("out")).map((el) => ({ text: el.textContent, kind: el.__captionKind || "agent" })),
+      onChange: () => this.#renderMedia(),
+      onSpeech: ({ id, phase }) => {
+        if (["ended", "cancel", "error"].includes(phase)) {
+          for (const el of this.$.captions.children) if (el.dataset.narration === id) el.__leave?.();
+        }
+      },
+    });
+    this.$.img.addEventListener("load", () => this.#media.flushRecordingFrame());
+    q(".media-settings").addEventListener("click", () => {
+      const panel = q(".media-panel");
+      panel.hidden = !panel.hidden;
+      q(".media-settings").setAttribute("aria-expanded", String(!panel.hidden));
+      if (!panel.hidden) q(".media-key").focus();
+    });
+    const run = async (fn) => {
+      if (this.#mediaBusy) return;
+      this.#mediaBusy = true;
+      this.#renderMedia();
+      try { await fn(); } catch (error) { this.#media.report(error); }
+      finally { this.#mediaBusy = false; this.#renderMedia(); }
+    };
+    q(".media-save").addEventListener("click", () => {
+      const input = q(".media-key");
+      const apiKey = input.value.trim();
+      input.value = "";
+      void run(() => this.#media.configure({ ...(apiKey ? { apiKey } : {}), voiceId: q(".media-voice").value.trim() }));
+    });
+    q(".media-local").addEventListener("click", () => { q(".media-key").value = ""; void run(() => this.#media.configure({ useLocalKey: true, voiceId: q(".media-voice").value.trim() })); });
+    q(".media-clear").addEventListener("click", () => { q(".media-key").value = ""; void run(() => this.#media.configure({ clearKey: true })); });
+    q(".media-tts").addEventListener("click", () => {
+      const enabled = !(this.#media.config.enabled && this.#media.config.driverId === this.#viewerId);
+      // Invoke resume while this click still holds browser user activation.
+      void run(async () => {
+        if (enabled) await this.#media.unlock();
+        await this.#media.configure({ enabled, voiceId: q(".media-voice").value.trim() });
+      });
+    });
+    q(".media-play").addEventListener("click", () => {
+      const cmd = this.#present.player?.state === "playing" ? "pause" : "resume";
+      if (cmd === "pause") this.#media.pauseSpeech();
+      else this.#media.resumeSpeech();
+      void run(async () => {
+        if (cmd === "resume" && this.#present.player?.state === "done") await this.#media.request("/player", { cmd: "goto", at: "1" });
+        const data = await this.#media.request("/player", { cmd });
+        this.#present.player = data.player;
+      });
+    });
+    q(".media-record").addEventListener("click", () => {
+      try {
+        if (this.#media.recording) this.#media.stopRecording();
+        else this.#media.startRecording();
+      } catch (error) { this.#media.report(error); }
+    });
+    this.#renderMedia();
+  }
+
+  #renderMedia() {
+    if (!this.#media) return;
+    const q = (selector) => this.#root.querySelector(selector);
+    const media = this.#media, config = media.config;
+    const recording = media.recording;
+    const own = config.enabled && config.driverId === this.#viewerId;
+    const tts = q(".media-tts");
+    tts.textContent = own ? "TTS 끄기" : config.enabled ? "이 화면에서 TTS 켜기" : "TTS 켜기";
+    tts.setAttribute("aria-pressed", String(own));
+    for (const selector of [".media-tts", ".media-save", ".media-local", ".media-clear", ".media-voice"]) q(selector).disabled = this.#mediaBusy || !!recording;
+    const play = q(".media-play");
+    play.textContent = this.#present.player?.state === "playing" ? "일시정지" : this.#present.player?.state === "done" ? "다시 재생" : "대본 재생";
+    play.disabled = this.#mediaBusy || !this.#present.player?.steps;
+    const record = q(".media-record");
+    record.textContent = recording?.stopping ? "영상 저장 중…" : recording ? "녹화 종료" : "녹화 시작";
+    record.setAttribute("aria-pressed", String(!!recording));
+    record.disabled = !!recording?.stopping;
+    const seconds = recording ? Math.floor((performance.now() - recording.started) / 1000) : 0;
+    q(".media-elapsed").textContent = recording ? `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}` : "";
+    const link = q(".media-download");
+    link.hidden = !media.download;
+    if (media.download) { link.href = media.download.url; link.download = media.download.name; }
+    else { link.removeAttribute("href"); link.removeAttribute("download"); }
+    const status = q(".media-status");
+    status.classList.toggle("error", !!media.error);
+    const errorText = Object.hasOwn(MEDIA_ERRORS, media.error) ? MEDIA_ERRORS[media.error] : media.error;
+    status.textContent = errorText || (own ? "TTS ON · 이 화면에서 음성 재생" : config.enabled ? "TTS ON · 다른 화면에서 음성 재생" : config.configured ? "TTS OFF · API 키 준비됨" : "TTS OFF · API 키 미설정");
+  }
+
   #setPresent(p) {
     const on = !!p?.on;
     const was = this.#present.on;
     this.#present = p ?? { on: false };
+    this.#media.observePlayer(p?.player?.state);
+    if (!on) this.#media.cancelSpeech();
+    if (!on) this.#media.stopRecording();
+    this.#renderMedia();
     this.#emit("agent-present", this.#present);
     this.#renderBusy();
     if (on === was) return;
@@ -1009,6 +1180,7 @@ class AgentBridge extends HTMLElement {
 
   // Raise: open the input and tell the agent to pause. Failures only show a hint; asking still works.
   async #raiseHand() {
+    this.#media.pauseSpeech();
     this.#event("손들기 확인 · 발표 일시정지");
     this.#qa = "raised";
     this.#openAsk("raised");
@@ -1078,22 +1250,26 @@ class AgentBridge extends HTMLElement {
 
   // Agent reply as a short-lived bubble over the presented screen.
   // kind "user": the viewer's own question (plain text, accent colour).
-  #caption(text, kind = "agent", ms = AgentBridge.CAPTION_MS) {
+  #caption(text, kind = "agent", ms = AgentBridge.CAPTION_MS, narration = null) {
     if (!text?.trim()) return;
     const el = document.createElement("div");
     el.className = `caption ${kind}`;
     el.part = "caption";
+    if (narration) el.dataset.narration = narration;
+    el.__captionKind = kind;
     if (kind === "user" || kind === "event") { el.textContent = text; el.classList.add("plain"); }
     else if (this.#md) el.innerHTML = this.#md(text);
     else { el.textContent = text; el.classList.add("plain"); }
     const box = this.$.captions;
     box.append(el);
+    this.#media.flushRecordingFrame();
     const leave = () => {
       if (el.classList.contains("out")) return;
       el.classList.add("out");
+      this.#media.flushRecordingFrame();
       setTimeout(() => el.remove(), 500);
     };
-    setTimeout(leave, ms);
+    if (!narration) setTimeout(leave, ms);
     const live = [...box.children].filter((c) => !c.classList.contains("out"));
     live.slice(0, Math.max(0, live.length - AgentBridge.CAPTION_MAX)).forEach((c) => c.__leave?.());
     el.__leave = leave;
