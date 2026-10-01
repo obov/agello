@@ -1027,6 +1027,9 @@ class AgentBridge extends HTMLElement {
       this.#sound = null;
     } else {
       if (this.#sound) return;
+      // iOS Safari mutes Web Audio with the ring/silent switch unless the
+      // page's audio session is "playback" (Safari 16.4+).
+      try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch {}
       const ctx = new AudioContext();
       ctx.resume().catch(() => {});
       const es = new EventSource(`${this.server}/screen/audio`);
