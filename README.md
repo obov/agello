@@ -8,6 +8,7 @@
 - Interactive terminal view of the existing herdr pane: live cursor, keyboard input, and automatic resize
 - Optional live view of a `terminal-browser` screen, with an on/off switch to control it yourself
 - Annotate: point at an element on that screen and send a request about it, with its CSS selector
+- Tab sound: hear that screen's audio on the page instead of the agent's machine
 - Embeddable `<agent-bridge>` web component
 
 Chat currently supports **Claude Code** sessions. The terminal view connects directly to the pane, including ordinary shells and other terminal applications.
@@ -72,6 +73,10 @@ The `주석` button on the screen panel turns on annotate mode: hovering tints t
 ```
 
 Selector: nearest unique `id` / `data-testid` ancestor, then `tag:nth-of-type` steps (light DOM only). Coordinates are CSS px of the viewport. Off while presenting and while "내 조작" is on.
+
+### Tab sound
+
+The `소리` button on the screen panel plays the relayed tab's audio on that page. While at least one page has it on, the tab is muted in the agent's terminal-browser; when the last one turns it off or closes, local playback returns within 4 seconds. agello reroutes the page's Web Audio output and `<audio>`/`<video>` elements into PCM chunks (`GET /screen/audio`, SSE), since CDP has no audio stream. Not captured: Web Audio connected before it was turned on (reload the tab), cross-origin media without CORS (keeps playing locally), cross-site iframes. Audio trails the screen by about 0.2s.
 
 ### Commands
 

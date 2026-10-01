@@ -8,6 +8,7 @@
 //                        (images are saved to $TMPDIR/agello-uploads and sent as [image: <path>])
 //                        (action "annotate": + target {selector, label, rect, text?, url?} from inspect)
 // GET  /screen           SSE: terminal-browser screen frames (CDP screencast)
+// GET  /screen/audio     SSE: tab audio as PCM chunks; muted in the browser while listened
 // POST /upload           {images: [{type, data(base64)}]} -> {paths}: terminal image paste
 // WS   /terminal         interactive herdr terminal frames, keyboard input, resize
 // GET  /panes            herdr workspace -> tab -> pane tree
@@ -583,6 +584,8 @@ export async function startServer(opts: ServerOptions) {
         return events(url.searchParams.get("viewer"));
       case "/screen":
         return screen.handle();
+      case "/screen/audio":
+        return screen.handleAudio();
       case "/terminal.js":
         return new Response(terminalJS, { headers: { "Content-Type": "text/javascript; charset=utf-8" } });
       case "/terminal.css":

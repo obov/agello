@@ -1,4 +1,5 @@
 import { runJson } from "./run.ts";
+import { AUDIO_BINDING, PAGE_AUDIO_JS, parsePcm } from "./page-audio.ts";
 
 // terminal-browser screen relay: CDP Page.startScreencast -> SSE (/screen).
 //
@@ -6,6 +7,10 @@ import { runJson } from "./run.ts";
 // follows its active tab, and streams JPEG frames only while at least one
 // viewer is connected. input() forwards whitelisted CDP Input.* commands
 // from the viewer to the page (user control).
+//
+// Page audio (GET /screen/audio, SSE): while at least one viewer listens, the
+// tab's audio is rerouted into PCM chunks for those viewers and muted locally
+// (see page-audio.ts). The last listener leaving restores local playback.
 
 type Browser = {
   key: string;
@@ -24,10 +29,12 @@ export type ScreenMeta = {
   url?: string;
   title?: string;
   agentControlled?: boolean;
+  audioListeners?: number; // status only
 };
 
 export function createScreencast(opts: { browserKey?: string; herdrTab?: () => Promise<string | undefined> }) {
   const viewers = new Set<ReadableStreamDefaultController>();
+  const listeners = new Set<ReadableStreamDefaultController>(); // page audio
   const enc = new TextEncoder();
 
   let meta: ScreenMeta = { connected: false };
@@ -39,6 +46,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
   let wsTarget = "";
   let msgId = 0;
   let timer: Timer | null = null;
+  let audioOn = false; // audio hook installed on the current CDP session
   const pending = new Map<number, (result: any) => void>();
 
   const emit = (c: ReadableStreamDefaultController, event: string, data: unknown) => {
@@ -46,9 +54,12 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
       c.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
     } catch {
       viewers.delete(c);
+      listeners.delete(c);
     }
   };
   const broadcast = (event: string, data: unknown) => viewers.forEach((c) => emit(c, event, data));
+  const AUDIO_OFF = "window.__agelloAudio?.off()";
+  const AUDIO_PING = "window.__agelloAudio?.ping()";
 
   function setMeta(next: ScreenMeta) {
     if (JSON.stringify(next) === JSON.stringify(meta)) return;
@@ -78,6 +89,10 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
   }
 
   function disconnect() {
+    // the old tab plays locally again (its own 4s timeout covers a lost message)
+    if (audioOn && ws?.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ id: ++msgId, method: "Runtime.evaluate", params: { expression: AUDIO_OFF } }));
+    audioOn = false;
     ws?.close();
     ws = null;
     wsTarget = "";
@@ -153,6 +168,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
       call("Page.enable");
       call("Page.startScreencast", { format: "jpeg", quality: 70, maxWidth: 1600, maxHeight: 1600 });
       if (clip) capture();
+      if (listeners.size) audioStart();
     };
     sock.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data));
@@ -160,6 +176,11 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
         const resolve = pending.get(msg.id)!;
         pending.delete(msg.id);
         resolve(msg.result ?? null);
+        return;
+      }
+      if (msg.method === "Runtime.bindingCalled" && msg.params?.name === AUDIO_BINDING) {
+        const chunk = listeners.size ? parsePcm(String(msg.params.payload ?? "")) : null;
+        if (chunk) listeners.forEach((c) => emit(c, "pcm", chunk));
         return;
       }
       if (msg.method !== "Page.screencastFrame") return;
@@ -175,6 +196,25 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
         wsTarget = "";
       }
     };
+  }
+
+  // Install the page hook (new documents too) and switch the tab to remote.
+  function audioStart() {
+    const sock = ws;
+    if (audioOn || !sock || sock.readyState !== WebSocket.OPEN) return;
+    audioOn = true;
+    const call = (method: string, params: object = {}) =>
+      sock.send(JSON.stringify({ id: ++msgId, method, params }));
+    call("Runtime.enable");
+    call("Runtime.addBinding", { name: AUDIO_BINDING });
+    call("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_AUDIO_JS });
+    call("Runtime.evaluate", { expression: PAGE_AUDIO_JS });
+    call("Runtime.evaluate", { expression: AUDIO_PING });
+  }
+  function audioPing() {
+    if (!listeners.size || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!audioOn) return audioStart();
+    ws.send(JSON.stringify({ id: ++msgId, method: "Runtime.evaluate", params: { expression: AUDIO_PING } }));
   }
 
   let syncing = false; // skip a tick while the previous sync is still running
@@ -200,6 +240,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     }
     const url = `ws://127.0.0.1:${b.cdpPort}/devtools/page/${tab.targetId}`;
     if (url !== wsTarget || !ws) connect(b.cdpPort, tab.targetId);
+    else audioPing();
     setMeta({
       connected: true,
       browser: b.key,
@@ -248,6 +289,31 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     });
   }
 
+  // SSE of page audio for one listener. Only meaningful alongside /screen
+  // (the relay runs while screen viewers are connected).
+  function handleAudio(): Response {
+    let ctrl!: ReadableStreamDefaultController;
+    let ping: Timer;
+    const stream = new ReadableStream({
+      start(c) {
+        ctrl = c;
+        listeners.add(c);
+        emit(c, "ready", {});
+        ping = setInterval(() => emit(c, "ping", {}), 15000);
+        audioPing();
+      },
+      cancel() {
+        clearInterval(ping);
+        listeners.delete(ctrl);
+        if (listeners.size === 0 && audioOn && ws?.readyState === WebSocket.OPEN)
+          ws.send(JSON.stringify({ id: ++msgId, method: "Runtime.evaluate", params: { expression: AUDIO_OFF } }));
+      },
+    });
+    return new Response(stream, {
+      headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+    });
+  }
+
   const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText"]);
   function input(raw: string) {
     let m: any;
@@ -263,7 +329,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
 
   // Which browser the relay uses (or would use), for status reporting.
   async function describe(): Promise<ScreenMeta> {
-    if (meta.connected) return meta;
+    if (meta.connected) return { ...meta, audioListeners: listeners.size };
     const { browser, reason } = await pickBrowser();
     return browser ? { connected: false, browser: browser.key } : { connected: false, reason };
   }
@@ -287,7 +353,7 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
     return r && !r.exceptionDetails ? (r.result?.value ?? null) : null;
   }
 
-  return { handle, input, describe, setClip, evaluate, inspect };
+  return { handle, handleAudio, input, describe, setClip, evaluate, inspect };
 }
 
 export type InspectQuery = { x?: number; y?: number; selector?: string; full?: boolean };

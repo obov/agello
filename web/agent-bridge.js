@@ -278,6 +278,8 @@ h1 { font-size: 14px; margin: 0; font-weight: 600; }
 /* annotate: hover tint, selected outline, request input next to the element */
 .annot-btn { flex: none; font-size: 12px; padding: 2px 10px; border-radius: 999px; }
 .annot-btn[aria-pressed="true"] { background: var(--_accent); border-color: var(--_accent); color: #fff; }
+.sound-btn { flex: none; font-size: 12px; padding: 2px 10px; border-radius: 999px; }
+.sound-btn[aria-pressed="true"] { background: var(--_accent); border-color: var(--_accent); color: #fff; }
 .viewport.annot img { cursor: crosshair; }
 .hl { position: absolute; z-index: 3; pointer-events: none; display: none; border-radius: 2px; }
 .hl.on { display: block; }
@@ -490,6 +492,7 @@ const TEMPLATE = `
 </section>
 <aside class="screen" part="screen">
   <div class="screen-bar"><span class="live" hidden>에이전트 조작 중</span><span class="url"></span>
+    <button class="sound-btn" type="button" aria-pressed="false" title="켜면 브라우저 탭 소리가 이 화면에서만 나와요 (에이전트 쪽 브라우저는 음소거)">소리</button>
     <button class="annot-btn" type="button" aria-pressed="false" title="화면의 요소를 골라 에이전트에게 요청 (선택자와 함께 전달)">주석</button>
     <button class="control-btn" role="switch" aria-checked="false" title="켜면 마우스와 키보드 입력이 브라우저로 전달돼요 (끄기: Shift+Esc)">
       <span>내 조작</span><span class="track"><span class="knob"></span></span><span class="state-label">OFF</span></button></div>
@@ -530,6 +533,7 @@ class AgentBridge extends HTMLElement {
   #root = this.attachShadow({ mode: "open" });
   #es = null;
   #screenEs = null;
+  #sound = null; // page audio: { ctx, es, next: Map<stream id, end time> }
   #ws = null; // /input: control input and annotate inspect queries
   #control = false;
   #annot = false;
@@ -577,7 +581,7 @@ class AgentBridge extends HTMLElement {
       body: q(".body"), screen: q(".screen"), captions: q(".captions"),
       busy: q(".busy"), hand: q(".hand"), end: q(".end"), ask: q(".ask"), askBox: q(".ask textarea"), askHint: q(".ask-hint"),
       askTitle: q(".ask-title"), askDone: q(".ask-done"),
-      annotBtn: q(".annot-btn"), hlHover: q(".hl.hover"), hlSel: q(".hl.sel"), hlLabel: q(".hl-label"),
+      annotBtn: q(".annot-btn"), soundBtn: q(".sound-btn"), hlHover: q(".hl.hover"), hlSel: q(".hl.sel"), hlLabel: q(".hl-label"),
       note: q(".note"), noteBox: q(".note textarea"), noteHint: q(".note-hint"), noteTarget: q(".note-target"),
     };
     this.$.buttons.forEach((b) => b.addEventListener("click", () => this.#submit(b.dataset.action)));
@@ -591,6 +595,7 @@ class AgentBridge extends HTMLElement {
     loadMarkdown().then((md) => (this.#md = md));
     this.#bindControl();
     this.#bindAnnotate();
+    this.$.soundBtn.addEventListener("click", () => this.#setSound(!this.#sound));
     this.#bindHand();
     q(".term-btn").addEventListener("click", () => this.#showTerminal(!this.hasAttribute("terminal-open")));
     q(".terminal-retry").addEventListener("click", () => this.#showTerminal(true));
@@ -617,12 +622,13 @@ class AgentBridge extends HTMLElement {
     this.#es = null;
     this.#screenEs?.close();
     this.#screenEs = null;
+    this.#setSound(false);
     this.#setControl(false);
     this.#setAnnotate(false);
   }
   attributeChangedCallback(name) {
     if (name === "heading") this.$.heading.textContent = this.getAttribute("heading") || "agello";
-    if (name === "server" && this.isConnected) { this.#showTerminal(false); this.#openPanes(false); this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#syncScreen(); }
+    if (name === "server" && this.isConnected) { this.#showTerminal(false); this.#openPanes(false); this.#connect(); this.#screenEs?.close(); this.#screenEs = null; this.#setSound(false); this.#syncScreen(); }
     if (name === "screen" && this.isConnected) this.#syncScreen();
   }
 
@@ -995,7 +1001,7 @@ class AgentBridge extends HTMLElement {
 
   #syncScreen() {
     const want = this.hasAttribute("screen") || this.#present.on;
-    if (!want) { this.#screenEs?.close(); this.#screenEs = null; this.#setControl(false); this.#setAnnotate(false); return; }
+    if (!want) { this.#screenEs?.close(); this.#screenEs = null; this.#setSound(false); this.#setControl(false); this.#setAnnotate(false); return; }
     if (this.#screenEs) return;
     const es = (this.#screenEs = new EventSource(`${this.server}/screen`));
     es.addEventListener("meta", (e) => this.#renderScreenMeta(JSON.parse(e.data)));
@@ -1007,6 +1013,49 @@ class AgentBridge extends HTMLElement {
       if (this.#annot) this.#annotFrame();
     });
     es.onerror = () => this.#renderScreenMeta({ connected: false });
+  }
+
+  // ---------- page audio ----------
+  // On: the relayed tab's audio plays here and is muted in the agent's
+  // browser (while any viewer has it on). The click creates the AudioContext,
+  // which is what the browser's autoplay policy needs.
+  #setSound(on) {
+    if (!on) {
+      if (!this.#sound) return;
+      this.#sound.es.close();
+      this.#sound.ctx.close().catch(() => {});
+      this.#sound = null;
+    } else {
+      if (this.#sound) return;
+      const ctx = new AudioContext();
+      ctx.resume().catch(() => {});
+      const es = new EventSource(`${this.server}/screen/audio`);
+      const s = (this.#sound = { ctx, es, next: new Map() });
+      es.addEventListener("pcm", (e) => this.#playPcm(s, JSON.parse(e.data)));
+    }
+    this.$.soundBtn.setAttribute("aria-pressed", String(!!this.#sound));
+  }
+
+  // One chunk: 16-bit little-endian stereo. Chunks of a stream are queued
+  // back to back; a gap or a backlog over 1s restarts with a 150ms buffer.
+  #playPcm(s, { c, r, d }) {
+    if (this.#sound !== s) return;
+    const bin = atob(d);
+    const pcm = new Int16Array(bin.length >> 1);
+    for (let i = 0; i < pcm.length; i++) pcm[i] = (bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8)) << 16 >> 16;
+    const n = pcm.length >> 1;
+    if (!n) return;
+    const buf = s.ctx.createBuffer(2, n, r);
+    const L = buf.getChannelData(0), R = buf.getChannelData(1);
+    for (let i = 0; i < n; i++) { L[i] = pcm[2 * i] / 32768; R[i] = pcm[2 * i + 1] / 32768; }
+    const src = s.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(s.ctx.destination);
+    const now = s.ctx.currentTime;
+    let at = s.next.get(c) ?? 0;
+    if (at < now + 0.02 || at > now + 1) at = now + 0.15;
+    src.start(at);
+    s.next.set(c, at + buf.duration);
   }
 
   // ---------- presentation mode ----------
