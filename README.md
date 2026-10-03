@@ -6,12 +6,12 @@
 - Live session status, tool activity, and prompts queued while the agent is busy (same order as the terminal)
 - Conversation saved per pane in the browser, kept across reloads
 - Interactive terminal view of the existing herdr pane: live cursor, keyboard input, and automatic resize
-- Optional live view of a `terminal-browser` screen, with an on/off switch to control it yourself
+- Optional live view of a `terminal-browser` screen (requires `--browser` option), with an on/off switch to control it yourself
 - Annotate: point at an element on that screen and send a request about it, with its CSS selector
 - Tab sound: hear that screen's audio on the page instead of the agent's machine
 - Embeddable `<agent-bridge>` web component
 
-Chat currently supports **Claude Code** sessions. The terminal view connects directly to the pane, including ordinary shells and other terminal applications.
+Chat supports **Claude Code and Codex CLI** sessions. The terminal view connects directly to the pane, including ordinary shells and other terminal applications.
 
 ## Requirements
 
@@ -97,7 +97,7 @@ State and logs: `~/.local/state/agello/<port>.json`, `<port>.log`.
 
 ### Pane picker
 
-Click the status in the header to open a drawer with herdr's workspace -> tab -> pane tree (the current pane's workspace is expanded; a workspace with a single tab lists its panes directly). Search filters by workspace, title, folder, or agent. Picking a pane switches the page to that pane's server, starting it if needed (`?server=` keeps the choice across reloads). Panes without Claude Code open as a terminal, since chat supports Claude Code only.
+Click the status in the header to open a drawer with herdr's workspace -> tab -> pane tree (the current pane's workspace is expanded; a workspace with a single tab lists its panes directly). Search filters by workspace, title, folder, or agent. Picking a pane switches the page to that pane's server, starting it if needed (`?server=` keeps the choice across reloads). Panes without Claude Code or Codex open as a terminal.
 
 `+` adds a workspace (top), a tab (workspace row), or splits a pane (pane row); new panes open as a terminal. Nothing can be closed from the page: closing a herdr pane ends its processes.
 
@@ -187,10 +187,14 @@ See `web/embed-example.html`.
 
 - **Send**: `herdr agent prompt <pane> "<text>"` (kept to 3 lines so Claude Code does not treat it as a paste)
 - **Status**: `herdr agent get` / `herdr pane get`, polled every 1.5s
-- **Chat**: tails the Claude Code transcript (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`) and streams it over SSE
+- **Chat**: tails Claude Code transcripts (`$CLAUDE_CONFIG_DIR/projects/*/<session>.jsonl`) or Codex rollouts (`$CODEX_HOME/sessions/**/rollout-*<session>.jsonl`) and normalizes messages and tools over SSE. Missing directories/files are retried.
+- **Codex identity**: uses herdr's session ID when available; otherwise `ps`/`lsof` resolves the Codex process in that exact pane. Pass `--session <id>` if automatic discovery is unavailable; use `CODEX_HOME` for a custom data directory.
+- **Codex pending input**: browser sends stay pending until the rollout confirms them. Native Tab-queued input is mirrored from `queue_1.sqlite` read-only when available. Enter submissions steer an active turn, matching Codex CLI.
 - **Panes**: `GET /panes` (`herdr workspace/tab/pane list`), `POST /panes/connect` (`agello start --pane`), `POST /panes/create` (`herdr workspace create`, `tab create`, `pane split`, always `--no-focus`)
 - **Terminal**: `/terminal` WebSocket relays `herdr terminal session control <pane>` ANSI frames and validated input, resize, and scroll commands to xterm.js
 - **Screen**: finds the terminal-browser CDP port via `terminal-browser ls --json` and relays `Page.startScreencast` frames; user control forwards `Input.*` events only
+
+See [Claude/Codex integration audit](docs/claude-codex-integration.md) for feature mapping, validation, and version-dependent limitations. When replacing the agent/session in a pane, stop and restart its agello server to bind the new session.
 
 ## Security
 
@@ -200,7 +204,7 @@ TTS keys remain in server memory until replaced, cleared with **키 삭제**, or
 
 ## Development
 
-Run `bun install` and `bun test`. Tests cover the pane tree and creation (against a mock herdr), local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, reconnect, TTS coordination, stale speech cancellation, and recording lifecycle and metadata.
+Run `bun install` and `bun test`. Tests cover Claude/Codex transcript normalization, exact-pane session discovery, native Codex queue mirroring, Codex HTTP/SSE input and replies, the pane tree and creation (against a mock herdr), local terminal assets, origin rejection, ANSI frames, keyboard bytes, resize, exclusive control, reconnect, TTS coordination, stale speech cancellation, and recording lifecycle and metadata.
 
 ## License
 

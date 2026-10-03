@@ -24,10 +24,14 @@
 // POST /script           {script: {rect?, steps: [{go?, say: string[], hold?}]}} load (keeps position)
 // POST /player           {cmd: "resume" | "pause" | "goto", at?: "3" | "3.2"}
 
+import { agentKind, createCodexLocator, findTranscript, codexHome } from "./agents.ts";
+import { createTranscript, BROWSER_PREFIX } from "./transcript.ts";
+import { readCodexQueue } from "./codex-queue.ts";
+export { BROWSER_PREFIX, isNarration } from "./transcript.ts";
 import { createTerminal, type SocketData } from "./terminal.ts";
 import { panesRoute } from "./panes.ts";
 import { mkdir } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runJson } from "./run.ts";
 import { createPlayer, parsePos, parseScript, type PlayerInfo } from "./player.ts";
@@ -42,7 +46,6 @@ export type ServerOptions = {
   browser?: string;
 };
 
-export const BROWSER_PREFIX = "[browser]";
 const UPLOAD_DIR = join(tmpdir(), "agello-uploads");
 const IMAGE_EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
 const MAX_IMAGES = 5;
@@ -83,43 +86,9 @@ export function formatPrompt(action: string, text: string): string {
   return [`${head} ${lines[0]}`, ...tail].join("\n");
 }
 
-// Claude Code wraps multi-line pasted input (4+ lines) in pasted_content tags.
-// Strip them for display.
-const PASTE_TAG = /<\/?pasted_content id="[^"]*">\n?/g;
-const unwrapPaste = (s: string) => s.replace(PASTE_TAG, "").trim();
-
-function toolSummary(input: any): string {
-  const s =
-    input?.description ??
-    input?.file_path ??
-    input?.pattern ??
-    input?.query ??
-    input?.url ??
-    input?.skill ??
-    input?.prompt ??
-    input?.command ??
-    "";
-  const text = String(s).replace(/\s+/g, " ").trim();
-  return text.length > 80 ? text.slice(0, 80) + "…" : text;
-}
-
-// Some models emit user-facing narration as a `thinking` block whose signature
-// carries a "narration" marker. Claude Code renders these like normal replies,
-// so treat them as assistant text. Plain (unmarked) thinking stays hidden.
-// The marker is an undocumented detail of the signature; if it changes, these
-// blocks are simply not shown (same as before).
-export function isNarration(b: any): boolean {
-  if (b?.type !== "thinking" || typeof b.thinking !== "string" || !b.thinking.trim()) return false;
-  try {
-    return Buffer.from(String(b.signature ?? "").slice(0, 200), "base64").includes("narration");
-  } catch {
-    return false;
-  }
-}
-
 // Every herdr call is killed after `timeout` ms so a hung herdr cannot pile up processes.
 async function herdr(timeout: number, ...cmd: string[]): Promise<any> {
-  return (await runJson(["herdr", ...cmd], timeout)) ?? { error: { code: "herdr_failed" } };
+  return (await runJson([Bun.which("herdr", { PATH: process.env.PATH }) ?? "herdr", ...cmd], timeout)) ?? { error: { code: "herdr_failed" } };
 }
 
 // Presentation rect from the API: finite, non-negative origin, positive size (CSS px).
@@ -150,7 +119,7 @@ export type Present = { on: boolean; rect?: Rect; since?: string; player?: Playe
 
 type Status =
   | { alive: false; reason: string; pane: string }
-  | { alive: true; status: string; pane: string; label?: string; session: string; title?: string };
+  | { alive: true; status: string; pane: string; label?: string; session?: string; agent: string; title?: string };
 
 // ---------- server ----------
 
@@ -169,21 +138,35 @@ export async function startServer(opts: ServerOptions) {
   const agentInfo = async (): Promise<any | null> =>
     (await herdr(3000, "agent", "get", PANE))?.result?.agent ?? null;
 
-  const SESSION: string | undefined = opts.session ?? (await agentInfo())?.agent_session?.value;
+  const initial = await agentInfo();
+  const KIND = agentKind(initial?.agent);
+  const codex = createCodexLocator(PANE);
+  const located = KIND === "codex" && !initial?.agent_session?.value ? await codex.locate() : null;
+  let SESSION: string | undefined = opts.session ?? initial?.agent_session?.value ?? located?.session;
+  let sessionHome = located?.home ?? codexHome();
+  let transcript: string | null = located?.session === SESSION ? located?.transcript ?? null : null;
+  const sessionMismatch = !!(located && SESSION && located.session !== SESSION);
 
   async function checkStatus(): Promise<Status> {
     // label (set with `herdr pane rename`) is only on pane get, not agent get
     const [a, p] = await Promise.all([agentInfo(), herdr(3000, "pane", "get", PANE)]);
     if (!a) return { alive: false, reason: "agent_not_found", pane: PANE };
-    if (a.agent !== "claude") return { alive: false, reason: "not_claude", pane: PANE };
-    const current = a.agent_session?.value;
-    if (SESSION && current !== SESSION) return { alive: false, reason: "session_changed", pane: PANE };
+    if (!agentKind(a.agent)) return { alive: false, reason: "unsupported_agent", pane: PANE };
+    if (a.agent !== KIND) return { alive: false, reason: "session_changed", pane: PANE };
+    const located = KIND === "codex" && !a.agent_session?.value ? await codex.locate() : null;
+    const current = a.agent_session?.value ?? located?.session;
+    if (located) sessionHome = located.home;
+    if (!SESSION && current) SESSION = current;
+    if (sessionMismatch || (SESSION && current && current !== SESSION))
+      return { alive: false, reason: "session_changed", pane: PANE };
+    if (KIND === "claude" && SESSION && current !== SESSION) return { alive: false, reason: "session_changed", pane: PANE };
     return {
       alive: true,
       status: a.agent_status,
       pane: PANE,
       label: p?.result?.pane?.label || undefined,
-      session: current,
+      session: SESSION,
+      agent: KIND!,
       title: a.terminal_title_stripped,
     };
   }
@@ -232,143 +215,42 @@ export async function startServer(opts: ServerOptions) {
 
   // ----- transcript tail -----
 
-  async function findTranscript(): Promise<string | null> {
-    if (!SESSION) return null;
-    const base = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
-    for await (const p of new Bun.Glob(`*/${SESSION}.jsonl`).scan({ cwd: base, absolute: true })) return p;
-    return null;
-  }
+  const { handleEntry, pendingTools, queue, syncQueue, pendingPrompt, cancelPrompt } = createTranscript(KIND ?? "claude", broadcast);
 
-  // Pending tools, so a page that connects mid-tool still shows the loader.
-  const pendingTools = new Map<string, { id: string; name: string; summary: string; ts?: string }>();
-
-  // Build a chat message from a user prompt string ([browser] prefix -> browser bubble).
-  function userMessage(raw: string, ts: string, extra: object = {}) {
-    const text = unwrapPaste(raw);
-    if (text.startsWith(BROWSER_PREFIX)) {
-      const [head, ...rest] = text.split("\n");
-      const m = head.match(/action=(\S+) ?(.*)$/);
-      const body = [m?.[2] ?? "", ...rest].filter(Boolean).join("\n");
-      return { role: "browser", action: m?.[1] ?? "message", text: body, ts, ...extra };
-    }
-    return { role: "terminal", text, ts, ...extra };
-  }
-
-  // Prompts typed while the agent is busy are queued by Claude Code:
-  //   queue-operation enqueue {content}          -> show as a "queued" bubble
-  //   queue-operation remove  {content, reason}  -> delivered mid-turn (absorbed_mid_turn)
-  //   attachment queued_command {prompt}         -> delivered mid-turn (same message)
-  //   queue-operation dequeue                    -> delivered at turn end (FIFO, no content);
-  //                                                 followed by a user entry (promptSource "queued")
-  //   queue-operation popAll                     -> queue pulled back into the input box
-  // System prompts (task notifications, "<tag>..." content) share the queue but are not shown.
-  type Queued = { id: string; text: string; human: boolean };
-  const queue: Queued[] = [];
-  const suppress: string[] = []; // delivered queue texts whose follow-up user entry must not duplicate
-  const isHumanPrompt = (t: string) => !/^\s*<[a-z][\w-]*>/i.test(t);
-
-  function deliver(q: Queued) {
-    if (q.human) broadcast("delivered", { id: q.id });
-  }
-
-  function handleQueue(d: any) {
-    const op = d.operation;
-    if (op === "enqueue" && typeof d.content === "string") {
-      const q = { id: `q-${d.timestamp}-${queue.length}`, text: d.content, human: isHumanPrompt(d.content) };
-      queue.push(q);
-      if (q.human) broadcast("message", userMessage(d.content, d.timestamp, { id: q.id, queued: true }));
-    } else if (op === "remove" && typeof d.content === "string") {
-      const i = queue.findIndex((q) => q.text === d.content);
-      if (i >= 0) deliver(queue.splice(i, 1)[0]);
-    } else if (op === "dequeue") {
-      const q = queue.shift();
-      if (q) {
-        deliver(q);
-        suppress.push(q.text);
+  // Retry discovery when the first rollout has not been created yet.
+  transcript ??= KIND ? await findTranscript(KIND, SESSION, sessionHome) : null;
+  let offset = transcript ? Bun.file(transcript).size : 0;
+  let reading = false;
+  async function readTranscript() {
+    if (reading) return;
+    reading = true;
+    try {
+      if (lastStatus && !lastStatus.alive) return;
+      if (!transcript && KIND && SESSION) {
+        transcript = await findTranscript(KIND, SESSION, sessionHome);
+        if (transcript) broadcast("hello", { transcript: true, pane: PANE, session: SESSION,
+          agent: KIND, queue: queue.filter((q) => q.human).map((q) => q.id), tools: [...pendingTools.keys()] });
       }
-    } else if (op === "popAll") {
-      for (const q of queue.splice(0)) if (q.human) broadcast("unqueued", { id: q.id });
-    }
-  }
-
-  function handleEntry(d: any) {
-    if (d.isSidechain) return;
-    const content = d.message?.content;
-
-    if (d.type === "queue-operation") return handleQueue(d);
-
-    if (d.type === "attachment" && d.attachment?.type === "queued_command") {
-      const i = queue.findIndex((q) => q.text === d.attachment.prompt);
-      if (i >= 0) deliver(queue.splice(i, 1)[0]);
-      return;
-    }
-
-    if (d.type === "user") {
-      const src = d.promptSource;
-      if (typeof content === "string" && (src === "typed" || src === "queued") && !d.isMeta) {
-        const s = suppress.indexOf(content);
-        if (s >= 0) {
-          suppress.splice(s, 1); // already shown as a queued bubble, now delivered
-          return;
-        }
-        broadcast("message", userMessage(content, d.timestamp));
-        return;
+      if (KIND === "codex" && SESSION) {
+        const native = readCodexQueue(sessionHome, SESSION);
+        if (native) syncQueue(native);
       }
-      if (Array.isArray(content)) {
-        for (const b of content) {
-          if (b.type === "tool_result") {
-            pendingTools.delete(b.tool_use_id);
-            broadcast("tool_end", { id: b.tool_use_id, isError: !!b.is_error });
-          }
-        }
+      if (!transcript) return;
+      const f = Bun.file(transcript);
+      if (f.size < offset) offset = 0;
+      if (f.size === offset) return;
+      const buf = new Uint8Array(await f.slice(offset, f.size).arrayBuffer());
+      const lastNl = buf.lastIndexOf(0x0a);
+      if (lastNl < 0) return;
+      offset += lastNl + 1;
+      for (const line of new TextDecoder().decode(buf.subarray(0, lastNl)).split("\n")) {
+        if (!line.trim()) continue;
+        try { handleEntry(JSON.parse(line)); } catch {}
       }
-      return;
-    }
-
-    if (d.type === "assistant" && Array.isArray(content)) {
-      for (const b of content) {
-        if (b.type === "text" && b.text.trim()) {
-          broadcast("message", { role: "assistant", text: b.text, ts: d.timestamp });
-        } else if (isNarration(b)) {
-          broadcast("message", { role: "assistant", text: b.thinking, ts: d.timestamp, narration: true });
-        } else if (b.type === "tool_use") {
-          const t = { id: b.id, name: b.name, summary: toolSummary(b.input), ts: d.timestamp };
-          pendingTools.set(b.id, t);
-          broadcast("tool_start", t);
-        }
-      }
-    }
+    } catch { /* The agent may rotate or remove a rollout while polling. */ }
+    finally { reading = false; }
   }
-
-  const transcript = await findTranscript();
-  if (transcript) {
-    // Start from current end: only messages after the server starts are streamed.
-    let offset = Bun.file(transcript).size;
-    let reading = false;
-    timers.push(
-      setInterval(async () => {
-        if (reading) return;
-        reading = true;
-        try {
-          const f = Bun.file(transcript);
-          if (f.size < offset) offset = 0; // truncated/rewritten
-          if (f.size === offset) return;
-          const buf = new Uint8Array(await f.slice(offset, f.size).arrayBuffer());
-          const lastNl = buf.lastIndexOf(0x0a);
-          if (lastNl < 0) return; // wait for full line
-          offset += lastNl + 1;
-          for (const line of new TextDecoder().decode(buf.subarray(0, lastNl)).split("\n")) {
-            if (!line.trim()) continue;
-            try {
-              handleEntry(JSON.parse(line));
-            } catch {}
-          }
-        } finally {
-          reading = false;
-        }
-      }, 300),
-    );
-  }
+  timers.push(setInterval(readTranscript, 300));
 
   // ----- screen relay -----
 
@@ -509,6 +391,7 @@ export async function startServer(opts: ServerOptions) {
           transcript: !!transcript,
           pane: PANE,
           session: SESSION,
+          agent: KIND,
           queue: queue.filter((q) => q.human).map((q) => q.id),
           tools: [...pendingTools.keys()],
         });
@@ -536,8 +419,13 @@ export async function startServer(opts: ServerOptions) {
     const st = await checkStatus();
     if (!st.alive) return { ok: false, error: st.reason, status: 409 };
     if (st.status === "blocked") return { ok: false, error: "agent_blocked", status: 409 };
-    const res = await herdr(10000, "agent", "prompt", PANE, formatPrompt(action, text.trim()));
-    if (res?.error) return { ok: false, error: res.error.code, status: 502 };
+    const prompt = formatPrompt(action, text.trim());
+    const pending = KIND === "codex" ? pendingPrompt(prompt) : null;
+    const res = await herdr(10000, "agent", "prompt", PANE, prompt);
+    if (res?.error) {
+      if (pending) cancelPrompt(pending);
+      return { ok: false, error: res.error.code, status: 502 };
+    }
     return { ok: true };
   }
 
@@ -682,8 +570,8 @@ export async function startServer(opts: ServerOptions) {
   return {
     url: `http://127.0.0.1:${server.port}`,
     pane: PANE,
-    session: SESSION,
-    transcript,
+    get session() { return SESSION; },
+    get transcript() { return transcript; },
     stop() {
       player.stop();
       tts.stop();

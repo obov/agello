@@ -82,8 +82,9 @@ export function createScreencast(opts: { browserKey?: string; herdrTab?: () => P
       const browser = all.find((b) => b.key === opts.browserKey);
       return browser ? { browser } : { reason: "browser_not_found" };
     }
+    // Browser is optional: if no --browser and no tab, gracefully disable screen streaming
     const tab = await opts.herdrTab?.();
-    if (!tab) return { reason: "tab_unknown" };
+    if (!tab) return {};
     const browser = all.find((b) => b.pane?.tab === tab);
     return browser ? { browser } : { reason: "no_browser_in_tab" };
   }

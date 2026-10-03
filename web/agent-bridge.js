@@ -74,6 +74,7 @@ function loadMarkdown() {
 const REASONS = {
   agent_not_found: "세션 종료 (pane 없음)",
   not_claude: "세션 종료 (지원 에이전트 아님)",
+  unsupported_agent: "세션 종료 (지원 에이전트 아님)",
   session_changed: "다른 세션으로 교체됨",
 };
 const STATES = { idle: "대기 중", working: "작업 중", blocked: "입력 대기", done: "완료", unknown: "상태 불명" };
@@ -949,11 +950,14 @@ class AgentBridge extends HTMLElement {
     }).catch((error) => { if (version === this.#mediaConnection) this.#media.report(error); });
     const on = (name, fn) => es.addEventListener(name, (e) => fn(JSON.parse(e.data)));
     on("hello", (d) => {
-      if (!d.transcript) this.$.hint.textContent = "대화 기록 파일 없음: 메시지 표시 불가";
+      this.$.hint.textContent = d.transcript ? "" : "대화 기록 파일 없음: 메시지 표시 불가";
       if (d.pane) this.#loadHistory(d.pane, d.queue ?? [], d.tools ?? []);
     });
     on("delivered", ({ id }) => { this.#deliver(id); this.#emit("agent-queue", { phase: "delivered", id }); });
     on("unqueued", ({ id }) => { this.#unqueue(id); this.#emit("agent-queue", { phase: "unqueued", id }); });
+    on("queue_order", ({ ids }) => {
+      for (const id of ids) { const row = this.#queued(id); if (row) this.$.queue.append(row); }
+    });
     on("status", (s) => this.#renderStatus(s));
     on("message", (m) => {
       // Joining during speech replays its caption snapshot, which may already
@@ -965,10 +969,9 @@ class AgentBridge extends HTMLElement {
       }
       // script lines carry their own on-screen time (>= 10s), others use CAPTION_MS
       if (this.#present.on && m.role === "assistant") this.#caption(m.text, "agent", m.hold * 1000 || undefined, typeof m.narration === "string" ? m.narration : null);
-      if (this.#present.on && m.role === "browser" && m.action === "message") this.#caption(m.text, "user");
+      if (!m.queued) this.#browserDelivered(m);
       // a reply to the viewer's question (status polling may miss a short working phase)
       // (the agent took the question once it is echoed in the transcript; earlier work was the hand-raise turn)
-      if (this.#qa === "asked" && m.role === "browser" && m.action === "message") this.#qaTaken = true;
       if (this.#qa === "asked" && this.#qaTaken && m.role === "assistant" && !m.script) { this.#qaWorked = true; this.#checkAnswered(); }
       this.#emit("agent-message", m);
     });
@@ -1698,6 +1701,13 @@ class AgentBridge extends HTMLElement {
     this.#addMessage(m);
     this.#history.push(m);
     this.#persist();
+    this.#browserDelivered(m);
+  }
+
+  #browserDelivered(m) {
+    if (m.role !== "browser" || m.action !== "message") return;
+    if (this.#present.on) this.#caption(m.text, "user");
+    if (this.#qa === "asked") this.#qaTaken = true;
   }
 
   // (lookup by iteration: the module-level `CSS` style string shadows window.CSS)
